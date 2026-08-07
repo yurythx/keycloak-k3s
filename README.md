@@ -307,28 +307,21 @@ precisa de atenção:
    usuário administrador (`kc_admin`) e usuário de banco (`keycloak_user`)
    já usados no Keycloak que roda hoje fora do K3s, para manter consistência
    — só as SENHAS precisam ser reais/fortes, os nomes de usuário já batem.
-2. No painel aaPanel/BT Panel do Nginx da borda: **os dois sites já
-   existem e já rodam** (Keycloak bare-metal em `:18443`, Vaultwarden
-   bare-metal em `:8081`, ambos na mesma VM `192.168.0.225`) — é só trocar
-   a porta do `proxy_pass` de cada um para `80` e adicionar os cabeçalhos
-   marcados. O diff exato de cada domínio está marcado com
-   `# ALTERADO:`/`# NOVO:` em `nginx-edge/sso.rondonopolis.mt.gov.br.conf`
-   e `nginx-edge/cofre.rondonopolis.mt.gov.br.conf`. Detalhes completos e
-   avisos sobre migração de dados em `nginx-edge/README.md`.
-3. **Antes do cutover definitivo**, planeje a migração dos dados dos
-   serviços atuais para o K3s — os bancos/discos do K3s começam vazios:
-   - Keycloak: dump/restore do Postgres atual (realms, usuários, clients).
-   - Vaultwarden: banco SQLite + pasta de anexos do Vaultwarden atual, para
-     o PVC do Vaultwarden novo — sem isso, os usuários "perderiam" acesso
-     aos cofres que já têm hoje.
-   Até esse plano estar pronto, teste o K3s por IP/porta interna
-   diretamente, sem apontar os domínios de produção para ele (ver
-   `nginx-edge/README.md`).
-4. ~~Configurar DNS~~ — como os dois domínios já funcionam em produção
-   hoje (apontando para o Keycloak/Vaultwarden bare-metal), o DNS já deve
-   estar correto, apontando para o IP público do Nginx da borda. Nada a
-   fazer aqui, a menos que a migração também troque o servidor de borda.
-5. A integração com o Active Directory (`rondonopolis.local`) **foi
+2. No painel aaPanel/BT Panel do Nginx da borda: os vhosts de `sso.` e
+   `cofre.` já existem, mas o Keycloak/Vaultwarden bare-metal que
+   rodavam nas portas `:18443`/`:8081` na VM `192.168.0.225` já foram
+   desativados (não havia dado real de produção — ambiente de
+   testes/POC). Ou seja, os dois domínios estão retornando erro hoje até
+   o K3s subir. Basta trocar a porta do `proxy_pass` de cada um para `80`
+   e adicionar os cabeçalhos marcados — sem se preocupar com migração de
+   dados. O diff exato está marcado com `# ALTERADO:`/`# NOVO:` em
+   `nginx-edge/sso.rondonopolis.mt.gov.br.conf` e
+   `nginx-edge/cofre.rondonopolis.mt.gov.br.conf`.
+3. ~~Configurar DNS~~ — como os dois domínios já foram usados em produção
+   antes, o DNS já deve estar correto, apontando para o IP público do
+   Nginx da borda. Nada a fazer aqui, a menos que a migração também troque
+   o servidor de borda.
+4. A integração com o Active Directory (`rondonopolis.local`) **foi
    deliberadamente deixada de fora desta migração** — ver nota abaixo.
 
 > ℹ️ **Sobre a integração com Active Directory (decisão tomada):** o
@@ -394,13 +387,6 @@ Vaultwarden), ambos com o certificado válido que o Nginx já gerencia.
 
 ## 6. Próximos passos recomendados (fora do escopo inicial)
 
-- **Migração de dados dos serviços atuais para o K3s**: o Keycloak e o
-  Vaultwarden bare-metal que já rodam hoje (mesma VM, portas `18443` e
-  `8081`) têm dados reais — realms/usuários/clients de um lado, cofres de
-  senha do outro. Os manifestos deste repositório sobem os dois serviços
-  **vazios**; ainda precisamos definir e executar um plano de
-  dump/restore (Postgres) e migração do SQLite+anexos (Vaultwarden) antes
-  do cutover definitivo (ver `nginx-edge/README.md`).
 - **Federação com o Active Directory (`rondonopolis.local`)**: decisão
   tomada de configurar manualmente pelo Admin Console depois do deploy,
   em vez de automatizar às cegas (ver nota completa na seção 4.6) — é o
