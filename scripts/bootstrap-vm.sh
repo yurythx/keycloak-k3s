@@ -14,23 +14,23 @@
 #
 # ⚠️ NÃO INSTALA cert-manager DE PROPÓSITO
 #   Nesta instalação, o HTTPS público é terminado por um servidor Nginx já
-#   existente na rede da prefeitura (fora deste cluster) — ver
-#   `nginx-edge/`. O Traefik dentro do K3s só fala HTTP internamente, então
-#   não há necessidade de emitir certificados dentro do cluster. Se um dia a
-#   arquitetura mudar (Traefik passar a terminar TLS diretamente), o
-#   cert-manager pode ser adicionado de volta — não é o caso hoje.
+#   existente na rede da prefeitura (fora deste cluster). O Keycloak e o
+#   Vaultwarden são expostos DIRETO nas portas 18443/8081 (via Service
+#   LoadBalancer do K3s — ver `k3s-cluster/keycloak.yaml` e
+#   `vaultwarden.yaml`), as MESMAS portas que os serviços antigos já
+#   usavam, então o Nginx não precisa de nenhuma alteração — ver
+#   `nginx-edge/README.md`. Sem TLS nenhum dentro do cluster, não há
+#   necessidade de cert-manager.
 #
 # O QUE ESTE SCRIPT **NÃO** FAZ (e por quê)
-#   - Configurar o Nginx da borda: é um servidor separado, fora desta VM —
-#     ver os arquivos de referência em `nginx-edge/`.
-#   - Port-forward/roteamento de rede até o Nginx da borda: depende da
-#     topologia da rede da prefeitura, que este script não alcança.
-#   - Criar os registros DNS (sso.rondonopolis.mt.gov.br / cofre.…): depende
-#     do provedor de DNS da prefeitura, fora do alcance deste script.
-#   - Trocar as senhas fictícias em k3s-cluster/secrets.yaml e o IP do Nginx
-#     em k3s-cluster/traefik-trusted-headers.yaml: são decisões de
-#     conteúdo, não de infraestrutura — continuam sendo editadas no
-#     repositório (fora da VM) e enviadas via `git push`, como manda o GitOps.
+#   - Configurar o Nginx da borda: não precisa — ele já aponta para as
+#     portas 18443/8081 desta VM, que o K3s passa a ocupar (ver
+#     `nginx-edge/README.md`). Nada a fazer lá.
+#   - Criar os registros DNS: os domínios já eram usados em produção antes
+#     desta migração, então o DNS já deve estar correto.
+#   - Trocar as senhas fictícias em k3s-cluster/secrets.yaml: é decisão de
+#     conteúdo, não de infraestrutura — continua sendo editada no
+#     repositório (fora da VM) e enviada via `git push`, como manda o GitOps.
 #
 # COMO USAR
 #   1. Copie este script para a VM (scp, git clone do repositório, etc.).
@@ -269,15 +269,10 @@ else
 fi
 echo
 echo "O que ainda depende de você, fora desta VM:"
-echo "  1. Descobrir o IP interno desta VM (rode: hostname -I) e o IP interno"
-echo "     do servidor Nginx da borda — vai precisar dos dois a seguir."
-echo "  2. No seu computador, editar e enviar (git push) para este repositório:"
-echo "     - k3s-cluster/secrets.yaml            (trocar as senhas fictícias)"
-echo "     - k3s-cluster/traefik-trusted-headers.yaml (colocar o IP real do"
-echo "       Nginx da borda, para o Traefik confiar no X-Forwarded-Proto)"
-echo "  3. No servidor Nginx da borda, copiar/adaptar os arquivos de"
-echo "     nginx-edge/*.conf, apontando 'proxy_pass' para o IP desta VM."
-echo "  4. Configurar os registros DNS tipo A apontando para o IP PÚBLICO do"
-echo "     Nginx da borda (não desta VM):"
-echo "       sso.rondonopolis.mt.gov.br"
-echo "       cofre.rondonopolis.mt.gov.br"
+echo "  1. No seu computador, editar k3s-cluster/secrets.yaml (trocar as"
+echo "     senhas fictícias) e dar 'git push origin main' — a pipeline"
+echo "     aplica sozinha via GitHub Actions."
+echo "  2. Nginx da borda: NADA A FAZER — os vhosts já apontam para as"
+echo "     portas 18443 (Keycloak) e 8081 (Vaultwarden) desta VM, que o"
+echo "     K3s passa a ocupar automaticamente (ver nginx-edge/README.md)."
+echo "  3. DNS: já deve estar correto (domínios usados em produção antes)."

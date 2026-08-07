@@ -114,37 +114,26 @@ jobs:
         #   runner, o pipeline falha AQUI, com uma mensagem de erro clara,
         #   em vez de falhar de forma confusa nos passos seguintes.
 
-      - name: 3. Configurar Traefik para confiar no Nginx da borda
-        run: kubectl apply -f k3s-cluster/traefik-trusted-headers.yaml
-        # ↑ Aplicado bem cedo, e ANTES do Namespace de propósito: este
-        #   recurso vive no namespace "kube-system" (gerencia o Traefik do
-        #   próprio K3s), não em "authentication" — não tem relação de
-        #   dependência com os passos seguintes, mas precisa estar em vigor
-        #   antes do Ingress (passo 13) para que o Keycloak/Vaultwarden já
-        #   recebam o X-Forwarded-Proto correto assim que ficarem no ar.
-        #   Reaplicar este arquivo é seguro (idempotente) inclusive se o IP
-        #   do Nginx da borda mudar no futuro — só editar e dar push de novo.
-
-      - name: 4. Aplicar Namespace
+      - name: 3. Aplicar Namespace
         run: kubectl apply -f k3s-cluster/namespaces.yaml
         # ↑ SEMPRE o primeiro manifesto: cria o namespace "authentication"
         #   onde todos os demais recursos vão residir. Se este passo não
         #   rodar primeiro, os passos seguintes falham com erro
         #   "namespaces authentication not found".
 
-      - name: 5. Aplicar Secrets (credenciais)
+      - name: 4. Aplicar Secrets (credenciais)
         run: kubectl apply -f k3s-cluster/secrets.yaml
         # ↑ Aplicado logo em seguida, pois o PostgreSQL, o Keycloak e o
         #   Vaultwarden (próximos passos) dependem destas credenciais via
         #   `secretKeyRef` para conseguirem sequer INICIAR.
 
-      - name: 6. Aplicar PostgreSQL (PVC + Deployment + Service)
+      - name: 5. Aplicar PostgreSQL (PVC + Deployment + Service)
         run: kubectl apply -f k3s-cluster/postgres-db.yaml
         # ↑ O arquivo postgres-db.yaml já contém o PVC (disco), o Deployment
         #   e o Service num único apply — o Kubernetes cria os 3 objetos na
         #   ordem correta internamente (PVC antes do Pod que o consome).
 
-      - name: 7. Aguardar o PostgreSQL ficar pronto
+      - name: 6. Aguardar o PostgreSQL ficar pronto
         run: |
           kubectl rollout status deployment/postgres \
             -n authentication --timeout=120s
@@ -154,7 +143,7 @@ jobs:
         #   banco estar realmente pronto faria os Pods dele entrarem em
         #   CrashLoopBackOff nas primeiras tentativas de conexão.
 
-      - name: 8. Aplicar NetworkPolicy (restringe acesso ao Postgres)
+      - name: 7. Aplicar NetworkPolicy (restringe acesso ao Postgres)
         run: kubectl apply -f k3s-cluster/network-policy.yaml
         # ↑ Aplicado logo após o Postgres existir, e ANTES do Keycloak, para
         #   que a regra "só o Keycloak pode falar com o banco" já esteja no
@@ -162,27 +151,30 @@ jobs:
         #   (Funciona em qualquer K3s — ver aviso sobre CNI/enforcement
         #   dentro do próprio arquivo network-policy.yaml.)
 
-      - name: 9. Aplicar CronJob de backup do PostgreSQL
+      - name: 8. Aplicar CronJob de backup do PostgreSQL
         run: kubectl apply -f k3s-cluster/postgres-backup-cronjob.yaml
         # ↑ Cria o PVC dedicado de backup e agenda o `pg_dump` diário às
         #   03:00 (America/Cuiaba). Aplicado aqui pois já depende do
-        #   Secret (passo 5) para as credenciais de conexão, e é
+        #   Secret (passo 4) para as credenciais de conexão, e é
         #   independente do Keycloak/Vaultwarden em si.
 
-      - name: 10. Aplicar Keycloak (Service headless + Deployment + Service)
+      - name: 9. Aplicar Keycloak (Service headless + Deployment + Services)
         run: kubectl apply -f k3s-cluster/keycloak.yaml
         # ↑ Cria o Service headless (usado pelo DNS_PING para o clustering
-        #   entre as 2 réplicas) e o Deployment do Keycloak, já apontando
-        #   para o Postgres (que garantimos estar pronto no passo 7).
+        #   entre as 2 réplicas), o Deployment do Keycloak (já apontando
+        #   para o Postgres, garantido pronto no passo 6), o Service
+        #   ClusterIP interno E o Service LoadBalancer que expõe a porta
+        #   18443 na VM — a MESMA porta que o Keycloak antigo usava, para
+        #   o Nginx da borda não precisar de nenhuma alteração de config
+        #   (ver `nginx-edge/README.md`).
 
-      - name: 11. Aplicar Vaultwarden (PVC + Deployment + Service)
+      - name: 10. Aplicar Vaultwarden (PVC + Deployment + Services)
         run: kubectl apply -f k3s-cluster/vaultwarden.yaml
-        # ↑ O cofre de senhas é independente do Postgres/Keycloak (usa seu
-        #   próprio SQLite embutido), então pode subir em paralelo
-        #   conceitualmente — mas mantemos sequencial por simplicidade e
-        #   clareza de logs.
+        # ↑ Mesmo raciocínio do Keycloak: inclui o Service LoadBalancer que
+        #   expõe a porta 8081 na VM, a mesma porta que o Vaultwarden
+        #   antigo já usava.
 
-      - name: 12. Aguardar Keycloak e Vaultwarden ficarem prontos
+      - name: 11. Aguardar Keycloak e Vaultwarden ficarem prontos
         run: |
           kubectl rollout status deployment/keycloak \
             -n authentication --timeout=180s
@@ -192,17 +184,7 @@ jobs:
         #   primeira execução, pois cria o schema do banco e o Master Realm
         #   — daí o timeout maior aqui em relação ao Vaultwarden.
 
-      - name: 13. Aplicar Ingress (roteamento interno via Traefik)
-        run: kubectl apply -f k3s-cluster/ingress.yaml
-        # ↑ ÚLTIMO passo de aplicação, de propósito: só ligamos o
-        #   roteamento depois que TODOS os serviços de backend já estão
-        #   comprovadamente no ar e saudáveis — evita que o Nginx da borda
-        #   repasse tráfego para um Traefik ainda sem rota configurada e
-        #   receba erro 502/503. Lembrando: quem fala HTTPS com a internet
-        #   é o Nginx externo (fora deste cluster) — este Ingress só cuida
-        #   do roteamento HTTP interno a partir dele (ver ingress.yaml).
-
-      - name: 14. Resumo final do estado do cluster
+      - name: 12. Resumo final do estado do cluster
         if: always()
         # ↑ `if: always()` faz este passo rodar SEMPRE, mesmo se algum passo
         #   anterior tiver falhado — útil para diagnóstico rápido direto
@@ -210,12 +192,7 @@ jobs:
         run: |
           echo "----- Pods no namespace authentication -----"
           kubectl get pods -n authentication -o wide
-          echo "----- Services no namespace authentication -----"
-          kubectl get svc -n authentication
-          echo "----- Ingress no namespace authentication -----"
-          kubectl get ingress -n authentication
+          echo "----- Services no namespace authentication (confira as portas 18443/8081) -----"
+          kubectl get svc -n authentication -o wide
           echo "----- CronJob de backup -----"
           kubectl get cronjob -n authentication
-          echo "----- Config do Traefik (trusted forwarded headers) -----"
-          kubectl get helmchartconfig traefik -n kube-system -o yaml 2>/dev/null || \
-            echo "HelmChartConfig do traefik não encontrado."

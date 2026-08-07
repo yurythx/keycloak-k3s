@@ -4,16 +4,15 @@ Stack de autenticação e cofre de senhas, self-hosted, implantada em **K3s**
 via **GitOps** com **GitHub Actions** e um **Self-Hosted Runner** — sem
 nunca expor SSH ou a API do Kubernetes para a internet.
 
-| Componente | Função | Réplicas | Domínio público |
-|---|---|---|---|
-| **Keycloak 26 (Quarkus)** | Identity Provider (SSO, OIDC/SAML) para os sistemas da prefeitura | 2 (alta disponibilidade) | `sso.rondonopolis.mt.gov.br` |
-| **PostgreSQL 16-alpine** | Banco de dados persistente do Keycloak | 1 | (interno, sem acesso externo) |
-| **Vaultwarden** | Cofre de senhas (compatível com Bitwarden) para as equipes de TI/administração | 1 | `cofre.rondonopolis.mt.gov.br` |
-| **Traefik** | Ingress Controller (já incluso no K3s) — roteia por domínio dentro do cluster | — | — |
-| **Nginx (fora do K3s)** | Servidor de borda **já existente** na rede da prefeitura — termina o HTTPS público e repassa para o Traefik | — | recebe os 2 domínios acima |
+| Componente | Função | Réplicas | Domínio público | Porta na VM |
+|---|---|---|---|---|
+| **Keycloak 26 (Quarkus)** | Identity Provider (SSO, OIDC/SAML) para os sistemas da prefeitura | 2 (alta disponibilidade) | `sso.rondonopolis.mt.gov.br` | `18443` |
+| **PostgreSQL 16-alpine** | Banco de dados persistente do Keycloak | 1 | (interno, sem acesso externo) | — |
+| **Vaultwarden** | Cofre de senhas (compatível com Bitwarden) para as equipes de TI/administração | 1 | `cofre.rondonopolis.mt.gov.br` | `8081` |
+| **Nginx (fora do K3s)** | Servidor de borda **já existente** na rede da prefeitura — termina o HTTPS público | — | recebe os 2 domínios acima | 80/443 |
 
 Este repositório já está **100% pronto para ser aplicado na VM assim que
-ela existir** — os domínios reais, o RBAC de clustering, o backup
+ela existir** — os domínios reais, o clustering do Keycloak, o backup
 automático e a segmentação de rede já estão todos configurados nos
 manifestos. O que falta é só a parte física (seção 4).
 
@@ -28,22 +27,18 @@ manifestos. O que falta é só a parte física (seção 4).
                             ▼
                   ┌─────────────────────┐
                   │  Nginx (borda, já    │  ← Servidor JÁ EXISTENTE na rede da
-                  │  existe na rede)     │    prefeitura. Termina o HTTPS real
-                  │  TERMINA o TLS       │    (guarda o certificado) e decide
-                  └──────────┬──────────┘    "pra qual VM/serviço mandar".
-                             │  HTTP puro (porta 80), com cabeçalhos
-                             │  X-Forwarded-Proto/Host/For
-                             ▼           (mesma VM, mesma porta — o Traefik
-                  ┌─────────────────────┐  quem separa por domínio)
-                  │   Traefik (K3s)      │
-                  └─────────┬───────────┘
-                             │  roteamento por domínio (Host header)
+                  │  existe na rede)     │    prefeitura (aaPanel/BT Panel).
+                  │  TERMINA o TLS       │    Vhosts JÁ CONFIGURADOS, SEM
+                  └──────────┬──────────┘    NENHUMA alteração necessária.
+                             │
               ┌──────────────┴─────────────┐
-              ▼                            ▼
- sso.rondonopolis.mt.gov.br     cofre.rondonopolis.mt.gov.br
-              │                            │
-   ┌──────────▼──────────┐      ┌──────────▼──────────┐
-   │  Service: keycloak    │      │ Service: vaultwarden │
+              │  proxy_pass para            │  proxy_pass para
+              │  192.168.0.225:18443        │  192.168.0.225:8081
+              ▼  (mesma porta de sempre)    ▼  (mesma porta de sempre)
+   ┌─────────────────────┐      ┌─────────────────────┐
+   │ Service LoadBalancer │      │ Service LoadBalancer │
+   │ keycloak-external     │      │ vaultwarden-external │
+   │ (porta 18443, K3s)    │      │ (porta 8081, K3s)    │
    └──────────┬──────────┘      └──────────┬──────────┘
               │ 2 réplicas                  │ 1 réplica
    ┌──────────▼──────────┐      ┌──────────▼──────────┐
@@ -62,15 +57,18 @@ manifestos. O que falta é só a parte física (seção 4).
                                    └────────────────────────┘
 ```
 
-**Por que o HTTPS termina no Nginx, e não no Traefik/K3s:** a rede da
-prefeitura já tem um servidor Nginx isolado dedicado a receber requisições
-públicas e direcioná-las para o backend correto — reaproveitamos essa peça
-já existente em vez de duplicar a responsabilidade dentro do cluster. Isso
-significa que **esta VM do K3s não precisa de nenhum IP público nem porta
-aberta para a internet** — só precisa ser alcançável pelo Nginx na rede
-interna, na porta 80. Detalhes técnicos completos (e o porquê de cada
-cabeçalho HTTP importar) estão comentados em `k3s-cluster/ingress.yaml`,
-`k3s-cluster/traefik-trusted-headers.yaml` e `nginx-edge/`.
+**Por que cada serviço é exposto na MESMA porta que já usava antes (18443
+e 8081), em vez de um Ingress único na porta 80:** esta VM já hospedava um
+Keycloak e um Vaultwarden bare-metal (ambiente de teste/POC, hoje
+desligados) nessas exatas portas, e o Nginx da borda já tem os vhosts
+configurados apontando para elas. Em vez de migrar para um esquema
+diferente (Ingress+Traefik na porta 80, roteando por domínio) — o que
+exigiria editar a configuração do Nginx, gerenciado por outra
+equipe/processo — o K3s foi configurado para **ocupar exatamente as
+mesmas portas de antes**, via `Service` do tipo `LoadBalancer` (usando o
+ServiceLB embutido do K3s, sem precisar instalar nada extra). Resultado:
+**zero alterações necessárias no Nginx**. Detalhes completos em
+`nginx-edge/README.md`.
 
 **Namespace único:** todos os recursos vivem dentro de `authentication`,
 isolados do resto do cluster.
@@ -78,8 +76,8 @@ isolados do resto do cluster.
 **Segurança de rede:** o Self-Hosted Runner do GitHub Actions roda DENTRO
 da VM e abre uma conexão de **saída** para buscar trabalho na GitHub —
 nenhuma porta de entrada (SSH, API do Kubernetes) precisa ficar exposta.
-Com o Nginx de borda cuidando do tráfego público, esta VM nem precisa ser
-alcançável diretamente da internet — só pelo Nginx, na rede interna.
+A VM só precisa ser alcançável pelo Nginx da borda, nas portas 18443 e
+8081 — nunca diretamente da internet.
 
 **Persistência:** PostgreSQL, Vaultwarden e os backups gravam em
 **PersistentVolumeClaims** usando a StorageClass `local-path` (já embutida
@@ -108,14 +106,16 @@ sobre backup off-site em `k3s-cluster/postgres-backup-cronjob.yaml`).
 | Keycloak (× 2 réplicas) | 600Mi cada (1200Mi total) | 1024Mi cada (2048Mi total) |
 | Vaultwarden | 64Mi | 128Mi |
 | Backup CronJob (só durante a execução diária, ~1 min/dia) | 64Mi | 256Mi |
-| Traefik (já incluso no K3s) | ~50Mi | — |
+| Traefik (já incluso no K3s, usado só internamente) | ~50Mi | — |
 | **Total aproximado no pior caso (limits)** | | **~3,5 GiB** |
 
 Isso deixa **mais de 4GB de RAM livres** na VM de 8GB para picos de tráfego,
 cache de disco do sistema operacional e crescimento futuro — uma margem de
 segurança confortável para não sofrer com OOM (Out of Memory) em produção.
 Como o HTTPS é terminado no Nginx da borda (fora desta VM), não rodamos
-cert-manager dentro do cluster — uma peça a menos disputando RAM.
+cert-manager dentro do cluster — uma peça a menos disputando RAM. A VM
+também precisa dividir espaço com apenas **2 vCPUs**, então evite rodar
+cargas de teste pesadas simultâneas nos primeiros deploys.
 
 > 💡 Todos os limites de CPU/RAM estão declarados nos próprios manifestos
 > (`resources.requests` / `resources.limits`), comentados linha a linha —
@@ -130,23 +130,21 @@ cert-manager dentro do cluster — uma peça a menos disputando RAM.
 keycloak-k3s/
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml                   # Pipeline GitOps (self-hosted runner, 14 passos)
+│       └── deploy.yml                   # Pipeline GitOps (self-hosted runner, 12 passos)
 ├── scripts/
 │   └── bootstrap-vm.sh                  # Script único: K3s + kubectl + runner
-├── nginx-edge/                          # Referência p/ colar no Nginx da borda (não roda no K3s)
+├── nginx-edge/                          # Cópia fiel do que já está no Nginx (referência, não aplicado)
 │   ├── README.md
 │   ├── sso.rondonopolis.mt.gov.br.conf
 │   └── cofre.rondonopolis.mt.gov.br.conf
 ├── k3s-cluster/
 │   ├── namespaces.yaml                  # Namespace "authentication"
 │   ├── secrets.yaml                     # Credenciais (Postgres, Keycloak, Vaultwarden)
-│   ├── traefik-trusted-headers.yaml     # Traefik confia no X-Forwarded-* do Nginx
 │   ├── postgres-db.yaml                 # PVC + Deployment + Service do PostgreSQL
-│   ├── keycloak.yaml                    # RBAC + Deployment (2 réplicas) + Service
-│   ├── vaultwarden.yaml                 # PVC + Deployment + Service do Vaultwarden
+│   ├── keycloak.yaml                    # Service headless + Deployment + Services (interno + porta 18443)
+│   ├── vaultwarden.yaml                 # PVC + Deployment + Services (interno + porta 8081)
 │   ├── network-policy.yaml              # Restringe acesso ao Postgres só ao Keycloak
-│   ├── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
-│   └── ingress.yaml                     # Roteamento Traefik (domínios -> Services)
+│   └── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
 └── README.md                            # Este arquivo
 ```
 
@@ -159,11 +157,11 @@ keycloak-k3s/
 - VM Bare Metal/Proxmox com **Linux** (Ubuntu Server 22.04/24.04
   recomendado), **8GB de RAM**, acesso root/sudo.
 - Conectividade de rede entre esta VM e o servidor **Nginx da borda**
-  (mesma VLAN/sub-rede, ou rota configurada entre elas) — a VM só precisa
-  aceitar conexões do Nginx na porta 80, nada mais.
+  (mesma VLAN/sub-rede) — a VM só precisa aceitar conexões do Nginx nas
+  portas 18443 e 8081.
 - Os domínios `sso.rondonopolis.mt.gov.br` e `cofre.rondonopolis.mt.gov.br`
-  já criados na zona DNS `rondonopolis.mt.gov.br`, prontos para apontar
-  para o **IP público do Nginx da borda** (não desta VM).
+  já existiam em produção antes (Keycloak/Vaultwarden bare-metal) — o DNS
+  já deve estar correto, apontando para o IP público do Nginx da borda.
 
 ### 4.2. Opção A (recomendada): script único de bootstrap automatizado
 
@@ -192,8 +190,7 @@ sudo GH_PAT="ghp_xxx_seu_token" ./scripts/bootstrap-vm.sh
 ```
 
 O script imprime, ao final, exatamente o que ainda falta fazer fora dele
-(editar segredos, IP do Nginx, config do Nginx, DNS) — pule direto para a
-seção 4.6.
+(editar segredos) — pule direto para a seção 4.6.
 
 > O token (`GH_PAT`) só é usado em memória, na hora de chamar a API do
 > GitHub para pegar um token de registro temporário (válido ~1h) — nunca é
@@ -222,10 +219,10 @@ sudo k3s kubectl get nodes
 # ↑ Deve mostrar 1 nó em status "Ready".
 ```
 
-> ℹ️ O instalador do K3s já vem com o **Traefik** (Ingress Controller) e o
+> ℹ️ O instalador do K3s já vem com o **ServiceLB** embutido (usado para
+> expor o Keycloak/Vaultwarden nas portas 18443/8081 — ver seção 1) e o
 > **Local Path Provisioner** (StorageClass `local-path`) habilitados por
-> padrão — não é preciso instalar nada extra para este projeto funcionar
-> (o HTTPS público fica por conta do Nginx da borda, já existente).
+> padrão — não é preciso instalar nada extra para este projeto funcionar.
 
 > ⚠️ **Sobre a NetworkPolicy (`network-policy.yaml`):** o K3s usa Flannel
 > como CNI padrão, que **não enforça** NetworkPolicies (o recurso é
@@ -294,12 +291,9 @@ sudo ./svc.sh status
 
 ### 4.6. Ajustes finais de conteúdo (antes do primeiro deploy)
 
-Os domínios (`sso.rondonopolis.mt.gov.br` e `cofre.rondonopolis.mt.gov.br`)
-e os IPs internos já conhecidos (VM `192.168.0.225`, Nginx da borda
-`192.168.0.218`) já estão preenchidos em `ingress.yaml`, `keycloak.yaml`,
-`vaultwarden.yaml`, `traefik-trusted-headers.yaml` e `nginx-edge/*.conf` —
-nada a fazer aí, a menos que algum desses IPs mude no futuro. O que ainda
-precisa de atenção:
+Os domínios, IPs (VM `192.168.0.225`, Nginx da borda `192.168.0.218`) e as
+portas legadas (`18443`/`8081`) já estão preenchidos em `keycloak.yaml` e
+`vaultwarden.yaml` — nada a fazer aí. O que ainda precisa de atenção:
 
 1. **Troque todas as senhas fictícias** em `k3s-cluster/secrets.yaml` (veja
    o passo a passo detalhado dentro do próprio arquivo — inclui como gerar
@@ -307,21 +301,11 @@ precisa de atenção:
    usuário administrador (`kc_admin`) e usuário de banco (`keycloak_user`)
    já usados no Keycloak que roda hoje fora do K3s, para manter consistência
    — só as SENHAS precisam ser reais/fortes, os nomes de usuário já batem.
-2. No painel aaPanel/BT Panel do Nginx da borda: os vhosts de `sso.` e
-   `cofre.` já existem, mas o Keycloak/Vaultwarden bare-metal que
-   rodavam nas portas `:18443`/`:8081` na VM `192.168.0.225` já foram
-   desativados (não havia dado real de produção — ambiente de
-   testes/POC). Ou seja, os dois domínios estão retornando erro hoje até
-   o K3s subir. Basta trocar a porta do `proxy_pass` de cada um para `80`
-   e adicionar os cabeçalhos marcados — sem se preocupar com migração de
-   dados. O diff exato está marcado com `# ALTERADO:`/`# NOVO:` em
-   `nginx-edge/sso.rondonopolis.mt.gov.br.conf` e
-   `nginx-edge/cofre.rondonopolis.mt.gov.br.conf`.
-3. ~~Configurar DNS~~ — como os dois domínios já foram usados em produção
-   antes, o DNS já deve estar correto, apontando para o IP público do
-   Nginx da borda. Nada a fazer aqui, a menos que a migração também troque
-   o servidor de borda.
-4. A integração com o Active Directory (`rondonopolis.local`) **foi
+2. **Nginx da borda: nada a fazer.** Os vhosts de `sso.` e `cofre.` já
+   apontam para `192.168.0.225:18443` e `192.168.0.225:8081` — exatamente
+   as portas que o K3s passa a ocupar. Ver `nginx-edge/README.md` para o
+   detalhamento completo dessa decisão.
+3. A integração com o Active Directory (`rondonopolis.local`) **foi
    deliberadamente deixada de fora desta migração** — ver nota abaixo.
 
 > ℹ️ **Sobre a integração com Active Directory (decisão tomada):** o
@@ -344,29 +328,33 @@ precisa de atenção:
 
 ```bash
 git add .
-git commit -m "Ajusta segredos e IP do Nginx de borda para producao"
+git commit -m "Ajusta segredos para producao"
 git push origin main
 ```
 
 Acompanhe a execução em **Actions** no GitHub — o job `aplicar-manifestos`
 vai rodar no seu runner self-hosted e aplicar os manifestos em ordem lógica:
-Config. do Traefik → Namespace → Secrets → PostgreSQL → NetworkPolicy →
-Backup CronJob → Keycloak → Vaultwarden → Ingress.
+Namespace → Secrets → PostgreSQL → NetworkPolicy → Backup CronJob →
+Keycloak → Vaultwarden.
 
 ### 4.8. Validar a implantação
 
 ```bash
 kubectl get pods -n authentication -o wide
-kubectl get ingress -n authentication
+kubectl get svc -n authentication -o wide
+# ↑ Confira que "keycloak-external" mostra a porta 18443 e
+#   "vaultwarden-external" mostra a porta 8081.
 
-# Direto da VM (ou de dentro da rede), simula o que o Nginx vai enviar:
-curl -H "Host: sso.rondonopolis.mt.gov.br" http://localhost/
+# Direto da VM, teste as portas que o Nginx usa:
+curl -I http://localhost:18443/
+curl -I http://localhost:8081/
 ```
 
-Depois de configurar e recarregar o Nginx da borda (seção 4.6, item 3),
-acesse `https://sso.rondonopolis.mt.gov.br` (deve mostrar a tela do
-Keycloak) e `https://cofre.rondonopolis.mt.gov.br` (deve mostrar a tela do
-Vaultwarden), ambos com o certificado válido que o Nginx já gerencia.
+Como o Nginx da borda já está configurado, acessar
+`https://sso.rondonopolis.mt.gov.br` (deve mostrar a tela do Keycloak) e
+`https://cofre.rondonopolis.mt.gov.br` (deve mostrar a tela do Vaultwarden)
+já deve funcionar assim que os Pods ficarem saudáveis — sem nenhum passo
+extra de configuração de borda.
 
 ---
 
@@ -380,7 +368,7 @@ Vaultwarden), ambos com o certificado válido que o Nginx já gerencia.
 | Ver backups disponíveis | `kubectl run -n authentication ls-backups --rm -it --image=busybox --restart=Never --overrides='{"spec":{"containers":[{"name":"ls-backups","image":"busybox","command":["ls","-lh","/backups"],"volumeMounts":[{"name":"b","mountPath":"/backups"}]}],"volumes":[{"name":"b","persistentVolumeClaim":{"claimName":"postgres-backup-pvc"}}]}}'` |
 | Forçar um backup fora do horário agendado | `kubectl create job -n authentication backup-manual --from=cronjob/postgres-backup` |
 | Ver uso de RAM/CPU real dos Pods | `kubectl top pods -n authentication` |
-| Testar o roteamento sem depender do Nginx | `curl -H "Host: sso.rondonopolis.mt.gov.br" http://IP_DA_VM/` |
+| Testar as portas legadas sem depender do Nginx | `curl -I http://IP_DA_VM:18443/` e `curl -I http://IP_DA_VM:8081/` |
 | Forçar reaplicação dos manifestos | Aba **Actions** → workflow **Deploy Auth Stack para o K3s** → **Run workflow** |
 
 ---

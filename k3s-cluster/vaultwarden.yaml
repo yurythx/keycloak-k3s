@@ -12,7 +12,11 @@
 #      de toda a stack: se este disco for perdido sem backup, os cofres são
 #      IRRECUPERÁVEIS — a criptografia é ponta a ponta pelo cliente).
 #   2. Deployment (1 réplica) -> o container do Vaultwarden.
-#   3. Service (ClusterIP)    -> endereço de rede interno usado pelo Ingress.
+#   3. Service (ClusterIP)    -> endereço de rede interno, uso só dentro do cluster.
+#   4. Service (LoadBalancer) -> expõe a porta 8081 na VM (mesma porta que o
+#      Vaultwarden antigo já usava), para o Nginx da borda continuar
+#      funcionando SEM nenhuma alteração de configuração — ver
+#      `nginx-edge/README.md` para o porquê desta abordagem.
 #
 # POR QUE 1 RÉPLICA APENAS?
 #   O Vaultwarden usa um banco SQLite embutido por padrão (arquivo local em
@@ -103,8 +107,7 @@ spec:
               #   acessam o cofre da Prefeitura de Rondonópolis-MT. Usado
               #   para gerar links corretos em e-mails de convite/recuperação
               #   e para validar WebAuthn/Passkeys. Precisa bater EXATAMENTE
-              #   com o host declarado em `ingress.yaml` (incluindo o
-              #   `https://` no início).
+              #   com o domínio configurado no vhost do Nginx da borda.
 
             - name: SIGNUPS_ALLOWED
               value: "false"
@@ -182,20 +185,21 @@ spec:
 
 ---
 # ------------------------------------------------------------------------------
-# 3) Service — endereço de rede interno para o Vaultwarden
+# 3) Service — endereço de rede interno para o Vaultwarden (uso dentro do cluster)
 # ------------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: vaultwarden
-  # ↑ Nome usado pelo ingress.yaml como `backend.service.name`.
   namespace: authentication
   labels:
     app: vaultwarden
 
 spec:
   type: ClusterIP
-  # ↑ Exposição apenas interna — o acesso externo passa pelo Ingress/Traefik.
+  # ↑ Exposição apenas interna — útil para diagnóstico dentro do cluster. A
+  #   exposição real para a internet é feita pelo Service LoadBalancer
+  #   abaixo, não por este.
 
   selector:
     app: vaultwarden
@@ -203,7 +207,47 @@ spec:
   ports:
     - name: http
       port: 80
-      # ↑ Porta exposta pelo Service (usada pelo Ingress).
       targetPort: http
       # ↑ Redireciona para a porta nomeada "http" (80) dentro do container.
+      protocol: TCP
+
+---
+# ------------------------------------------------------------------------------
+# 4) Service (LoadBalancer) — expõe o Vaultwarden na PORTA 8081, a MESMA
+#    porta que o Vaultwarden antigo (bare-metal) já usava nesta VM
+# ------------------------------------------------------------------------------
+# ⚠️ POR QUE ISSO EXISTE (em vez de um Ingress na porta 80)
+#   Mesmo raciocínio do Service equivalente em `keycloak.yaml`: o vhost do
+#   Nginx da borda (aaPanel) já aponta para "192.168.0.225:8081" — não
+#   queremos exigir NENHUMA alteração de configuração lá. Este Service faz
+#   o K3s "ocupar" a mesma porta 8081 na VM, replicando exatamente o que
+#   já existia.
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden-external
+  namespace: authentication
+  labels:
+    app: vaultwarden
+
+spec:
+  type: LoadBalancer
+  # ↑ Atendido automaticamente pelo ServiceLB embutido do K3s ("klipper-lb")
+  #   — sem precisar instalar MetalLB nem nada externo.
+
+  externalTrafficPolicy: Local
+  # ↑ Preserva o IP de origem real da conexão (o IP do Nginx da borda) em
+  #   vez de mascará-lo — ver explicação completa no Service equivalente
+  #   de `keycloak.yaml`. Seguro aqui porque o cluster é single-node.
+
+  selector:
+    app: vaultwarden
+
+  ports:
+    - name: legacy-8081
+      port: 8081
+      # ↑ A porta que o Nginx já usa — não mude isso sem também mudar a
+      #   config do Nginx (o que estamos justamente tentando evitar).
+      targetPort: http
       protocol: TCP

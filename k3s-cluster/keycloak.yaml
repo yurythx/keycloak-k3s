@@ -7,10 +7,13 @@
 #   outro continua atendendo login da prefeitura sem interrupção.
 #
 # RECURSOS DECLARADOS NESTE ARQUIVO (em ordem lógica):
-#   1. Service headless -> dá a cada Pod do Keycloak um registro DNS
+#   1. Service headless    -> dá a cada Pod do Keycloak um registro DNS
 #      individual, usado pelo protocolo de clustering (ver abaixo).
 #   2. Deployment (2 réplicas) -> os Pods do Keycloak propriamente ditos.
-#   3. Service (ClusterIP)     -> endereço de rede interno usado pelo Ingress.
+#   3. Service (ClusterIP) -> endereço de rede interno, uso só dentro do cluster.
+#   4. Service (LoadBalancer) -> expõe a porta 18443 na VM (mesma porta que
+#      o Keycloak antigo já usava), para o Nginx da borda continuar
+#      funcionando SEM nenhuma alteração de configuração — ver seção 4.
 #
 # COMO FUNCIONA O CLUSTERING (histórico de um erro real corrigido aqui)
 #   Com 2 réplicas, cada Pod do Keycloak precisa saber da EXISTÊNCIA do outro
@@ -158,9 +161,10 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-              # ↑ Porta HTTP interna do Keycloak. Fica atrás do Traefik
-              #   (TLS/HTTPS é terminado no Ingress — ver ingress.yaml), por
-              #   isso rodamos só HTTP aqui dentro do cluster.
+              # ↑ Porta HTTP interna do Keycloak. TLS/HTTPS é terminado no
+              #   Nginx da borda (fora deste cluster) — por isso rodamos só
+              #   HTTP puro aqui dentro (ver Service LoadBalancer, seção 4
+              #   deste arquivo, e nginx-edge/README.md).
             - name: management
               containerPort: 9000
               # ↑ Desde o Keycloak 25+, os endpoints de health/metrics vivem
@@ -234,7 +238,7 @@ spec:
               #   Ainda assim mantemos o KC_PROXY_HEADERS/KC_PROXY_TRUSTED_ADDRESSES
               #   abaixo como camada extra (defesa em profundidade, mesmo
               #   padrão do ambiente atual). Precisa bater EXATAMENTE com o
-              #   host declarado em `ingress.yaml` e no Nginx (`nginx-edge/`).
+              #   domínio configurado no vhost do Nginx da borda.
 
             - name: KC_HOSTNAME_STRICT
               value: "false"
@@ -247,8 +251,10 @@ spec:
               # ↑ Habilita o listener HTTP puro (porta 8080) DENTRO do
               #   cluster. É seguro pois o tráfego HTTP não sai da rede
               #   interna do K3s: quem fala HTTPS com a internet é o Nginx
-              #   da borda (fora deste cluster — ver nginx-edge/), que
-              #   repassa a requisição já decodificada para o Traefik.
+              #   da borda (fora deste cluster), que repassa a requisição
+              #   já decodificada DIRETO para este Pod, na porta 18443
+              #   exposta pelo Service LoadBalancer (seção 4 abaixo) — sem
+              #   Ingress/Traefik no meio do caminho (ver nginx-edge/).
 
             - name: KC_PROXY_HEADERS
               value: "xforwarded"
@@ -256,30 +262,25 @@ spec:
               #   valor aceito é exatamente "xforwarded" (sem hífen) — ele
               #   instrui o Keycloak a CONFIAR nos cabeçalhos
               #   X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host
-              #   que chegam até ele (repassados pelo Traefik, que por sua
-              #   vez só confia neles quando vêm do Nginx da borda — ver
-              #   `traefik-trusted-headers.yaml`). Usado principalmente para
-              #   IP de origem correto nos logs de auditoria, já que o
-              #   esquema (https) já vem fixo via KC_HOSTNAME acima.
+              #   que chegam até ele. Usado principalmente para IP de
+              #   origem correto nos logs de auditoria, já que o esquema
+              #   (https) já vem fixo via KC_HOSTNAME acima.
 
             - name: KC_PROXY_TRUSTED_ADDRESSES
-              value: "10.42.0.0/16"
-              # ↑ Equivalente, dentro do K3s, ao `PROXY_TRUSTED_ADDRESSES`
+              value: "192.168.0.218/32,10.42.0.0/16"
+              # ↑ Mesmo espírito do `PROXY_TRUSTED_ADDRESSES=192.168.0.218`
               #   já usado no `.env` do Keycloak que roda hoje fora do K3s
-              #   (lá, aponta para o IP do Nginx: 192.168.0.218 — o proxy
-              #   que fala DIRETO com o Keycloak). AQUI dentro do cluster,
-              #   quem fala DIRETO com o Keycloak não é o Nginx, é o
-              #   Traefik — e o IP do Pod do Traefik é DINÂMICO (atribuído
-              #   pela rede interna do K3s a cada reinício). Por isso,
-              #   confiamos na faixa inteira de IPs de Pods do cluster
-              #   (CIDR padrão do K3s/Flannel: 10.42.0.0/16) em vez de um
-              #   IP único. Isso é seguro porque essa rede é interna e não
-              #   alcançável de fora da VM — só outros Pods do próprio
-              #   cluster estão nela.
-              #   ⚠️ Se o seu K3s foi instalado com `--cluster-cidr`
-              #   customizado (não o padrão), ajuste este valor para bater
-              #   — confira com: `cat /etc/rancher/k3s/config.yaml` ou
-              #   `kubectl cluster-info dump | grep -m1 cluster-cidr` na VM.
+              #   — o Nginx da borda fala DIRETO com este Pod agora (sem
+              #   Traefik no meio, graças ao Service LoadBalancer da seção
+              #   4), então o IP real do Nginx volta a ser o principal.
+              #   Incluímos TAMBÉM o CIDR de Pods do cluster
+              #   (10.42.0.0/16) como rede extra confiável, cobrindo o caso
+              #   de o Kubernetes fazer NAT na conexão antes dela chegar
+              #   ao Pod (comportamento que pode variar). Depois do
+              #   primeiro deploy, vale conferir nos logs do Keycloak qual
+              #   IP de origem ele está realmente enxergando e, se
+              #   quiser, restringir esta lista para só o que for
+              #   observado de fato.
 
             - name: KC_LOG_LEVEL
               value: "INFO"
@@ -397,21 +398,23 @@ spec:
 
 ---
 # ------------------------------------------------------------------------------
-# 3) Service — endereço de rede interno para o Keycloak
+# 3) Service — endereço de rede interno para o Keycloak (uso dentro do cluster)
 # ------------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: keycloak
-  # ↑ Este nome é o que o ingress.yaml vai usar como `backend.service.name`.
   namespace: authentication
   labels:
     app: keycloak
 
 spec:
   type: ClusterIP
-  # ↑ Só acessível de dentro do cluster — quem expõe para a internet é o
-  #   Ingress/Traefik (ver ingress.yaml), nunca o Service diretamente.
+  # ↑ Só acessível de dentro do cluster — útil para diagnóstico
+  #   (`kubectl exec ... curl http://keycloak:8080/`) e para qualquer outro
+  #   Pod do cluster que precise falar com o Keycloak internamente. A
+  #   exposição para a internet é feita pelo Service LoadBalancer abaixo,
+  #   não por este.
 
   selector:
     app: keycloak
@@ -420,7 +423,63 @@ spec:
   ports:
     - name: http
       port: 8080
-      # ↑ Porta exposta pelo Service para o resto do cluster (usada pelo Ingress).
+      # ↑ Porta exposta pelo Service para o resto do cluster.
       targetPort: http
       # ↑ Redireciona para a porta nomeada "http" (8080) dentro do container.
+      protocol: TCP
+
+---
+# ------------------------------------------------------------------------------
+# 4) Service (LoadBalancer) — expõe o Keycloak na PORTA 18443, a MESMA porta
+#    que o Keycloak antigo (bare-metal) já usava nesta VM
+# ------------------------------------------------------------------------------
+# ⚠️ POR QUE ISSO EXISTE (em vez de um Ingress na porta 80)
+#   O Nginx da borda (aaPanel, 192.168.0.218) já tem um vhost configurado e
+#   FUNCIONANDO apontando para "192.168.0.225:18443" — a mesma VM, a MESMA
+#   porta que o Keycloak antigo usava. Para não precisar mexer em NADA na
+#   configuração do Nginx (zero risco de errar algo lá, zero downtime
+#   dependente de outra equipe), fazemos o K3s "ocupar" essa mesma porta na
+#   VM, mantendo o Nginx 100% como já está. Ver `nginx-edge/README.md` para
+#   a explicação completa de por que esta abordagem foi escolhida em vez de
+#   Ingress+Traefik (que exigiria editar o Nginx para apontar pra porta 80).
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-external
+  namespace: authentication
+  labels:
+    app: keycloak
+
+spec:
+  type: LoadBalancer
+  # ↑ No K3s "de fábrica", `type: LoadBalancer` é atendido automaticamente
+  #   pelo ServiceLB embutido (também chamado "klipper-lb") — sem precisar
+  #   instalar MetalLB nem nada externo. Ele faz um Pod escutar a porta
+  #   pedida (18443) DIRETO NA VM (0.0.0.0:18443) e encaminhar para este
+  #   Service — é o que faz o Nginx conseguir falar com
+  #   "192.168.0.225:18443" e chegar até aqui, exatamente como antes.
+
+  externalTrafficPolicy: Local
+  # ↑ IMPORTANTE: sem isso, o Kubernetes reescreveria o IP de origem das
+  #   conexões (SNAT/masquerade) antes de entregar ao Pod do Keycloak — o
+  #   Keycloak enxergaria toda conexão como vinda de dentro do cluster, e
+  #   nunca do IP real do Nginx (192.168.0.218), quebrando a lógica de
+  #   KC_PROXY_TRUSTED_ADDRESSES (ver keycloak.yaml). Com "Local", o IP de
+  #   origem é preservado. Seguro aqui porque o cluster é single-node (só
+  #   existe "pmrkeycloak") — em um cluster multi-node, "Local" exigiria
+  #   que o Nginx soubesse especificamente qual nó tem o Pod, o que não é
+  #   o caso aqui.
+
+  selector:
+    app: keycloak
+
+  ports:
+    - name: legacy-18443
+      port: 18443
+      # ↑ A porta que o Nginx já usa — não mude isso sem também mudar a
+      #   config do Nginx (o que estamos justamente tentando evitar).
+      targetPort: http
+      # ↑ Redireciona para a porta nomeada "http" (8080) dentro do
+      #   container — mesmo targetPort do Service interno acima.
       protocol: TCP
