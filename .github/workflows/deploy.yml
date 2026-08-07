@@ -177,12 +177,19 @@ jobs:
       - name: 11. Aguardar Keycloak e Vaultwarden ficarem prontos
         run: |
           kubectl rollout status deployment/keycloak \
-            -n authentication --timeout=180s
+            -n authentication --timeout=300s
           kubectl rollout status deployment/vaultwarden \
             -n authentication --timeout=120s
-        # ↑ O Keycloak pode demorar mais para subir (até 3 minutos) na
-        #   primeira execução, pois cria o schema do banco e o Master Realm
-        #   — daí o timeout maior aqui em relação ao Vaultwarden.
+        # ↑ O Keycloak pode demorar para subir na primeira execução (cria o
+        #   schema do banco e o Master Realm) e, como usamos
+        #   maxUnavailable=0/maxSurge=1, uma troca de imagem/config faz as
+        #   2 réplicas serem substituídas uma de cada vez — cada uma leva
+        #   ~60-90s só na fase de "augmentation" do Quarkus (visto na
+        #   prática rodando o primeiro deploy real). 300s dá margem
+        #   confortável para as 2 réplicas trocarem sem falso-negativo
+        #   (o Deployment fica saudável de qualquer forma, mesmo se este
+        #   passo estourar o tempo — é só a CONFIRMAÇÃO da pipeline que
+        #   ficaria imprecisa com um timeout curto demais).
 
       - name: 12. Resumo final do estado do cluster
         if: always()
