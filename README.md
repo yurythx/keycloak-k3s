@@ -295,24 +295,41 @@ sudo ./svc.sh status
 ### 4.6. Ajustes finais de conteúdo (antes do primeiro deploy)
 
 Os domínios (`sso.rondonopolis.mt.gov.br` e `cofre.rondonopolis.mt.gov.br`)
-já estão configurados em `ingress.yaml`, `keycloak.yaml` e
-`vaultwarden.yaml` — nada a fazer aí. O que ainda precisa de atenção:
+e os IPs internos já conhecidos (VM `192.168.0.225`, Nginx da borda
+`192.168.0.218`) já estão preenchidos em `ingress.yaml`, `keycloak.yaml`,
+`vaultwarden.yaml`, `traefik-trusted-headers.yaml` e `nginx-edge/*.conf` —
+nada a fazer aí, a menos que algum desses IPs mude no futuro. O que ainda
+precisa de atenção:
 
 1. **Troque todas as senhas fictícias** em `k3s-cluster/secrets.yaml` (veja
    o passo a passo detalhado dentro do próprio arquivo — inclui como gerar
-   senhas fortes com `openssl rand -base64 32`).
-2. Edite `k3s-cluster/traefik-trusted-headers.yaml` e troque o IP de
-   exemplo (`10.10.0.50/32`) pelo IP interno real do seu servidor Nginx de
-   borda — **essencial** para o Keycloak reconhecer corretamente que o
-   usuário acessou via HTTPS (sem isso, o login pode entrar em loop de
-   redirecionamento).
-3. Copie os arquivos de `nginx-edge/*.conf` para dentro da configuração já
-   existente do seu Nginx, trocando `SUBSTITUA_PELO_IP_DA_VM_K3S` pelo IP
-   interno real desta VM, e ajustando os caminhos dos certificados TLS
-   (`ssl_certificate`/`ssl_certificate_key`) para os que o Nginx já usa.
-4. Aponte os registros DNS tipo **A** de `sso.rondonopolis.mt.gov.br` e
-   `cofre.rondonopolis.mt.gov.br` para o **IP público do Nginx da borda**
-   (não desta VM).
+   senhas fortes com `openssl rand -base64 32`). Considere usar o mesmo
+   usuário administrador (`kc_admin`) e usuário de banco (`keycloak_user`)
+   já usados no Keycloak que roda hoje fora do K3s, para manter consistência
+   — só as SENHAS precisam ser reais/fortes, os nomes de usuário já batem.
+2. Copie os arquivos de `nginx-edge/*.conf` para dentro da configuração já
+   existente do seu Nginx, ajustando os caminhos dos certificados TLS
+   (`ssl_certificate`/`ssl_certificate_key`) para os que o Nginx já usa —
+   o `proxy_pass` já aponta para o IP correto desta VM.
+3. Aponte os registros DNS tipo **A** de `sso.rondonopolis.mt.gov.br` e
+   `cofre.rondonopolis.mt.gov.br` para o **IP público** do Nginx da borda
+   (não o IP interno `192.168.0.218` — esse é só para a rede local).
+4. Se você planeja federar os usuários do Keycloak com o Active Directory
+   da prefeitura (`rondonopolis.local`), veja a nota específica sobre isso
+   no final desta seção — **ainda não está automatizado neste repositório**.
+
+> ⚠️ **Sobre a integração com Active Directory:** o Keycloak que já roda
+> hoje fora do K3s tem variáveis `AD_DOMAIN`, `AD_DC_HOSTNAME` e `AD_DC_IP`
+> no seu `.env`, indicando federação com o Active Directory
+> (`rondonopolis.local`, `dc01.rondonopolis.local`). Essa parte da
+> configuração normalmente não é feita só com variáveis de ambiente lidas
+> pelo Keycloak — costuma envolver um provider LDAP configurado via
+> Admin Console/REST API (ou um realm importado), com credenciais de bind
+> no AD que não vêm no `.env`. Como isso é específico de como o `setup.sh`
+> atual monta essa configuração, este repositório AINDA NÃO replica a
+> federação com o AD — os manifestos aqui sobem um Keycloak funcional,
+> mas com gestão de usuários local (banco Postgres), até essa parte ser
+> definida e adicionada.
 
 ### 4.7. Disparar o primeiro deploy
 
@@ -361,6 +378,12 @@ Vaultwarden), ambos com o certificado válido que o Nginx já gerencia.
 
 ## 6. Próximos passos recomendados (fora do escopo inicial)
 
+- **🔴 Federação com o Active Directory (`rondonopolis.local`)**: o
+  Keycloak atual (fora do K3s) já integra com o AD da prefeitura — esta
+  migração para K3s AINDA NÃO replica essa federação (ver seção 4.6). É o
+  item de maior impacto pendente antes de esta stack poder substituir a
+  atual em produção, já que sem ela os usuários da prefeitura não
+  logariam com a conta do domínio.
 - **Sealed Secrets / SOPS**: para versionar segredos criptografados no Git
   em vez de texto plano (ver aviso detalhado em `secrets.yaml`).
 - **Backup off-site**: o CronJob já grava backups diários no disco da VM,

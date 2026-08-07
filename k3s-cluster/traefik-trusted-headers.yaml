@@ -65,17 +65,13 @@ spec:
     #   oficial do Traefik que queremos sobrescrever/adicionar.
 
     additionalArguments:
-      - "--entrypoints.web.forwardedHeaders.trustedIPs=10.10.0.50/32"
-      # ↑ ⚠️ TROQUE "10.10.0.50" PELO IP REAL DO SEU NGINX DA BORDA NA
-      #   REDE INTERNA (o IP que a VM do K3s enxerga como origem da
-      #   conexão vinda do Nginx — normalmente o IP dele na mesma
-      #   VLAN/sub-rede da VM). Pode ser uma lista, separada por vírgula,
-      #   se houver mais de um Nginx/IP de origem, ex.:
-      #   "--entrypoints.web.forwardedHeaders.trustedIPs=10.10.0.50/32,10.10.0.51/32"
-      #
-      #   Se preferir liberar por toda uma sub-rede em vez de um IP único
-      #   (ex.: toda a VLAN de servidores de borda), use a notação CIDR,
-      #   ex.: "10.10.0.0/24".
+      - "--entrypoints.web.forwardedHeaders.trustedIPs=192.168.0.218/32"
+      # ↑ IP real do servidor Nginx da borda na rede interna da prefeitura
+      #   (mesmo IP usado em PROXY_TRUSTED_ADDRESSES no setup.sh do
+      #   Keycloak que já roda hoje fora do K3s — mantemos o mesmo padrão
+      #   de confiança aqui). Se um dia houver mais de um Nginx/IP de
+      #   origem, separe por vírgula, ex.:
+      #   "--entrypoints.web.forwardedHeaders.trustedIPs=192.168.0.218/32,192.168.0.219/32"
       #
       #   Com este IP configurado, o Traefik passa a CONFIAR e REPASSAR os
       #   cabeçalhos X-Forwarded-Proto/X-Forwarded-For/X-Forwarded-Host que
@@ -85,10 +81,10 @@ spec:
       #   do mundo).
 
 # ==============================================================================
-# COMO DESCOBRIR O IP CORRETO A COLOCAR ACIMA:
-#   No servidor Nginx da borda, rode: hostname -I  (ou veja a config de rede)
-#   — use o IP que ele usa na MESMA rede/VLAN da VM do K3s (não o IP
-#   público dele voltado para a internet).
+# SE O IP DO NGINX DA BORDA MUDAR NO FUTURO:
+#   No servidor Nginx, rode: hostname -I  (ou veja a config de rede) — use
+#   o IP que ele usa na MESMA rede da VM do K3s (não o IP público dele
+#   voltado para a internet), edite a linha acima e dê `git push` de novo.
 #
 # COMO VALIDAR SE FUNCIONOU (depois de aplicado + Nginx configurado):
 #   No Keycloak, acesse https://sso.rondonopolis.mt.gov.br e confira se o

@@ -12,13 +12,20 @@ quer que o padrão de vhosts de vocês já esteja organizado).
 | `sso.rondonopolis.mt.gov.br.conf` | Keycloak | Traefik → Service `keycloak` |
 | `cofre.rondonopolis.mt.gov.br.conf` | Vaultwarden | Traefik → Service `vaultwarden` |
 
-## O que você PRECISA ajustar antes de usar
+## Rede desta instalação
 
-Em **ambos** os arquivos, procure por `SUBSTITUA_PELO_IP_DA_VM_K3S` e troque
-pelo IP interno real da VM onde o K3s está rodando (ex.: `10.10.0.20`). Os
-dois domínios apontam para a **mesma VM**, na **mesma porta 80** — é o
-Traefik, dentro do cluster, quem decide para qual aplicação (Keycloak ou
-Vaultwarden) encaminhar, com base no `Host` que o Nginx repassa.
+| Servidor | IP interno |
+|---|---|
+| VM do K3s | `192.168.0.225` |
+| Nginx da borda (este servidor) | `192.168.0.218` |
+
+Os dois arquivos `.conf` já apontam para `192.168.0.225:80` — os dois
+domínios vão para a **mesma VM**, na **mesma porta 80**; é o Traefik,
+dentro do cluster, quem decide para qual aplicação (Keycloak ou
+Vaultwarden) encaminhar, com base no `Host` que o Nginx repassa. Se o IP da
+VM mudar no futuro, atualize os dois arquivos aqui.
+
+## O que você PRECISA ajustar antes de usar
 
 Os caminhos de certificado (`ssl_certificate` / `ssl_certificate_key`) estão
 com placeholders — ajuste para onde o seu Nginx já guarda os certificados
@@ -41,7 +48,7 @@ sobrescrevê-los — os dois lados (Nginx + Traefik) têm que estar alinhados.
 
 ```bash
 # Do próprio servidor Nginx, teste se a VM do K3s responde na porta 80:
-curl -H "Host: sso.rondonopolis.mt.gov.br" http://SUBSTITUA_PELO_IP_DA_VM_K3S/
+curl -H "Host: sso.rondonopolis.mt.gov.br" http://192.168.0.225/
 
 # Depois de recarregar o Nginx (nginx -t && systemctl reload nginx),
 # teste de fora da rede:

@@ -222,27 +222,34 @@ spec:
                   #   plano neste manifesto — só existe dentro do Secret.
 
             # --- Credenciais do administrador (usadas só no 1º boot) ------
-            - name: KEYCLOAK_ADMIN
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
               valueFrom:
                 secretKeyRef:
                   name: auth-stack-credentials
-                  key: KEYCLOAK_ADMIN
+                  key: KC_BOOTSTRAP_ADMIN_USERNAME
+              # ↑ Nome atual desta variável a partir do Keycloak 26 (a antiga
+              #   `KEYCLOAK_ADMIN` foi descontinuada). Confirmado pelo `.env`
+              #   do Keycloak que já roda hoje fora do K3s nesta prefeitura.
 
-            - name: KEYCLOAK_ADMIN_PASSWORD
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: auth-stack-credentials
-                  key: KEYCLOAK_ADMIN_PASSWORD
+                  key: KC_BOOTSTRAP_ADMIN_PASSWORD
 
-            # --- Hostname público e proxy reverso (Traefik) ----------------
+            # --- Hostname público (fixo, não depende de cabeçalho algum) ---
             - name: KC_HOSTNAME
-              value: "sso.rondonopolis.mt.gov.br"
-              # ↑ Domínio público pelo qual os usuários acessam o Keycloak
-              #   (SSO da Prefeitura de Rondonópolis-MT). Usado para gerar
-              #   corretamente os links internos (login, redirect URIs,
-              #   e-mails) — se estiver errado, o Keycloak gera URLs
-              #   quebradas mesmo funcionando "por dentro". Precisa bater
-              #   EXATAMENTE com o host declarado em `ingress.yaml`.
+              value: "https://sso.rondonopolis.mt.gov.br"
+              # ↑ URL pública completa (com esquema `https://`) pela qual os
+              #   usuários acessam o Keycloak. Passar a URL completa (em vez
+              #   de só o domínio) faz o Keycloak usar SEMPRE "https://" ao
+              #   gerar links/redirects/cookies, independente de qualquer
+              #   cabeçalho de proxy — é o MESMO padrão já usado no `.env`
+              #   do Keycloak que roda hoje fora do K3s nesta prefeitura.
+              #   Ainda assim mantemos o KC_PROXY_HEADERS/KC_PROXY_TRUSTED_ADDRESSES
+              #   abaixo como camada extra (defesa em profundidade, mesmo
+              #   padrão do ambiente atual). Precisa bater EXATAMENTE com o
+              #   host declarado em `ingress.yaml` e no Nginx (`nginx-edge/`).
 
             - name: KC_HOSTNAME_STRICT
               value: "false"
@@ -254,19 +261,47 @@ spec:
               value: "true"
               # ↑ Habilita o listener HTTP puro (porta 8080) DENTRO do
               #   cluster. É seguro pois o tráfego HTTP não sai da rede
-              #   interna do K3s — quem fala HTTPS com o mundo externo é o
-              #   Traefik (Ingress), que faz TLS termination.
+              #   interna do K3s: quem fala HTTPS com a internet é o Nginx
+              #   da borda (fora deste cluster — ver nginx-edge/), que
+              #   repassa a requisição já decodificada para o Traefik.
 
             - name: KC_PROXY_HEADERS
               value: "xforwarded"
-              # ↑ Este é o parâmetro pedido para integração com o Traefik do
-              #   K3s. NOTA TÉCNICA: nas versões atuais do Keycloak/Quarkus, o
+              # ↑ NOTA TÉCNICA: nas versões atuais do Keycloak/Quarkus, o
               #   valor aceito é exatamente "xforwarded" (sem hífen) — ele
               #   instrui o Keycloak a CONFIAR nos cabeçalhos
               #   X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host
-              #   enviados pelo Traefik, reconstruindo corretamente o
-              #   protocolo (https) e IP de origem do usuário, mesmo estando
-              #   atrás de um proxy reverso.
+              #   que chegam até ele (repassados pelo Traefik, que por sua
+              #   vez só confia neles quando vêm do Nginx da borda — ver
+              #   `traefik-trusted-headers.yaml`). Usado principalmente para
+              #   IP de origem correto nos logs de auditoria, já que o
+              #   esquema (https) já vem fixo via KC_HOSTNAME acima.
+
+            - name: KC_PROXY_TRUSTED_ADDRESSES
+              value: "10.42.0.0/16"
+              # ↑ Equivalente, dentro do K3s, ao `PROXY_TRUSTED_ADDRESSES`
+              #   já usado no `.env` do Keycloak que roda hoje fora do K3s
+              #   (lá, aponta para o IP do Nginx: 192.168.0.218 — o proxy
+              #   que fala DIRETO com o Keycloak). AQUI dentro do cluster,
+              #   quem fala DIRETO com o Keycloak não é o Nginx, é o
+              #   Traefik — e o IP do Pod do Traefik é DINÂMICO (atribuído
+              #   pela rede interna do K3s a cada reinício). Por isso,
+              #   confiamos na faixa inteira de IPs de Pods do cluster
+              #   (CIDR padrão do K3s/Flannel: 10.42.0.0/16) em vez de um
+              #   IP único. Isso é seguro porque essa rede é interna e não
+              #   alcançável de fora da VM — só outros Pods do próprio
+              #   cluster estão nela.
+              #   ⚠️ Se o seu K3s foi instalado com `--cluster-cidr`
+              #   customizado (não o padrão), ajuste este valor para bater
+              #   — confira com: `cat /etc/rancher/k3s/config.yaml` ou
+              #   `kubectl cluster-info dump | grep -m1 cluster-cidr` na VM.
+
+            - name: KC_LOG_LEVEL
+              value: "INFO"
+              # ↑ Nível de log padrão (mesmo valor já usado no `.env` atual
+              #   fora do K3s). Aumente para "DEBUG" temporariamente ao
+              #   investigar um problema específico — gera bem mais volume
+              #   de log, não deixe ligado permanentemente em produção.
 
             # --- Health checks e observabilidade ---------------------------
             - name: KC_HEALTH_ENABLED
