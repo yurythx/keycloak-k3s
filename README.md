@@ -314,22 +314,24 @@ precisa de atenção:
 3. Aponte os registros DNS tipo **A** de `sso.rondonopolis.mt.gov.br` e
    `cofre.rondonopolis.mt.gov.br` para o **IP público** do Nginx da borda
    (não o IP interno `192.168.0.218` — esse é só para a rede local).
-4. Se você planeja federar os usuários do Keycloak com o Active Directory
-   da prefeitura (`rondonopolis.local`), veja a nota específica sobre isso
-   no final desta seção — **ainda não está automatizado neste repositório**.
+4. A integração com o Active Directory (`rondonopolis.local`) **foi
+   deliberadamente deixada de fora desta migração** — ver nota abaixo.
 
-> ⚠️ **Sobre a integração com Active Directory:** o Keycloak que já roda
-> hoje fora do K3s tem variáveis `AD_DOMAIN`, `AD_DC_HOSTNAME` e `AD_DC_IP`
-> no seu `.env`, indicando federação com o Active Directory
-> (`rondonopolis.local`, `dc01.rondonopolis.local`). Essa parte da
-> configuração normalmente não é feita só com variáveis de ambiente lidas
-> pelo Keycloak — costuma envolver um provider LDAP configurado via
-> Admin Console/REST API (ou um realm importado), com credenciais de bind
-> no AD que não vêm no `.env`. Como isso é específico de como o `setup.sh`
-> atual monta essa configuração, este repositório AINDA NÃO replica a
-> federação com o AD — os manifestos aqui sobem um Keycloak funcional,
-> mas com gestão de usuários local (banco Postgres), até essa parte ser
-> definida e adicionada.
+> ℹ️ **Sobre a integração com Active Directory (decisão tomada):** o
+> Keycloak que já roda hoje fora do K3s tem variáveis `AD_DOMAIN`,
+> `AD_DC_HOSTNAME` e `AD_DC_IP` no seu `.env`, indicando federação com o
+> AD (`rondonopolis.local`, `dc01.rondonopolis.local`). Essa configuração
+> normalmente envolve um provider LDAP montado via Admin Console/REST API
+> (com credenciais de bind que não vêm em variável de ambiente), então
+> optamos por **não tentar recriar isso às cegas neste repositório**. A
+> stack sobe com gestão de usuários local (banco Postgres) e, depois que o
+> Keycloak novo estiver no ar, a federação com o AD é configurada
+> manualmente pelo Admin Console — mesmo processo de sempre, só que
+> apontando para este Keycloak em vez do que roda fora do K3s hoje.
+> Caminho: **Realm → User federation → Add provider → ldap**, usando os
+> mesmos dados de conexão (`AD_DC_HOSTNAME`/`AD_DC_IP`, porta 389/636,
+> Base DN, etc.) e a credencial de bind que já está em uso no ambiente
+> atual.
 
 ### 4.7. Disparar o primeiro deploy
 
@@ -378,10 +380,10 @@ Vaultwarden), ambos com o certificado válido que o Nginx já gerencia.
 
 ## 6. Próximos passos recomendados (fora do escopo inicial)
 
-- **🔴 Federação com o Active Directory (`rondonopolis.local`)**: o
-  Keycloak atual (fora do K3s) já integra com o AD da prefeitura — esta
-  migração para K3s AINDA NÃO replica essa federação (ver seção 4.6). É o
-  item de maior impacto pendente antes de esta stack poder substituir a
+- **Federação com o Active Directory (`rondonopolis.local`)**: decisão
+  tomada de configurar manualmente pelo Admin Console depois do deploy,
+  em vez de automatizar às cegas (ver nota completa na seção 4.6) — é o
+  item de maior impacto antes de esta stack poder substituir o Keycloak
   atual em produção, já que sem ela os usuários da prefeitura não
   logariam com a conta do domínio.
 - **Sealed Secrets / SOPS**: para versionar segredos criptografados no Git
