@@ -191,7 +191,35 @@ jobs:
         #   passo estourar o tempo — é só a CONFIRMAÇÃO da pipeline que
         #   ficaria imprecisa com um timeout curto demais).
 
-      - name: 12. Resumo final do estado do cluster
+      - name: 12. Configurar federação com o Active Directory
+        run: |
+          if ! kubectl get secret ad-bind-credentials -n authentication > /dev/null 2>&1; then
+            echo "AVISO: Secret 'ad-bind-credentials' ainda não existe."
+            echo "Passo pulado sem falhar o deploy do restante da stack."
+            echo "Crie-o manualmente (ver cabecalho de k3s-cluster/ldap-federation-job.yaml)"
+            echo "e rode este workflow novamente para ativar a federacao com o AD."
+            exit 0
+          fi
+          kubectl delete job ldap-federation-setup -n authentication --ignore-not-found
+          kubectl apply -f k3s-cluster/ldap-federation-job.yaml
+          kubectl wait --for=condition=complete --timeout=120s \
+            job/ldap-federation-setup -n authentication || \
+            kubectl logs -n authentication job/ldap-federation-setup --tail=50
+        # ↑ Este passo é TOLERANTE A FALHA de propósito, no mesmo espírito
+        #   de outros passos opcionais desta pipeline: a federação com o AD
+        #   depende de um Secret criado manualmente uma única vez (fora do
+        #   Git — ver aviso no topo de ldap-federation-job.yaml). Sem esse
+        #   Secret, o passo é pulado (`exit 0`) em vez de derrubar o deploy
+        #   inteiro — Keycloak e Vaultwarden já estão no ar de qualquer forma.
+        #   `kubectl delete` antes do `apply`: Jobs do Kubernetes são
+        #   IMUTÁVEIS depois de criados — sem apagar primeiro, reaplicar um
+        #   Job já existente com o mesmo nome falharia. Apagar e recriar a
+        #   cada deploy garante que mudanças neste arquivo (ou rotação da
+        #   senha do AD) sejam reaplicadas automaticamente — a lógica
+        #   interna do Job é idempotente (verifica antes de criar), então
+        #   rodar de novo em todo deploy é seguro e não duplica nada.
+
+      - name: 13. Resumo final do estado do cluster
         if: always()
         # ↑ `if: always()` faz este passo rodar SEMPRE, mesmo se algum passo
         #   anterior tiver falhado — útil para diagnóstico rápido direto

@@ -144,7 +144,8 @@ keycloak-k3s/
 │   ├── keycloak.yaml                    # Service headless + Deployment + Services (interno + porta 18443)
 │   ├── vaultwarden.yaml                 # PVC + Deployment + Services (interno + porta 8081)
 │   ├── network-policy.yaml              # Restringe acesso ao Postgres só ao Keycloak
-│   └── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
+│   ├── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
+│   └── ldap-federation-job.yaml         # Job: cria Realm "rondonopolis" + federação com o AD
 └── README.md                            # Este arquivo
 ```
 
@@ -305,24 +306,35 @@ portas legadas (`18443`/`8081`) já estão preenchidos em `keycloak.yaml` e
    apontam para `192.168.0.225:18443` e `192.168.0.225:8081` — exatamente
    as portas que o K3s passa a ocupar. Ver `nginx-edge/README.md` para o
    detalhamento completo dessa decisão.
-3. A integração com o Active Directory (`rondonopolis.local`) **foi
-   deliberadamente deixada de fora desta migração** — ver nota abaixo.
+3. **Federação com o Active Directory**: automatizada via
+   `k3s-cluster/ldap-federation-job.yaml` (um Job que roda `kcadm.sh` e
+   cria o Realm `rondonopolis` + o provider LDAP sozinho, a cada deploy).
+   Único passo manual necessário — criar, uma única vez, o Secret com a
+   senha da conta de bind (nunca commitado no Git):
+   ```bash
+   kubectl create secret generic ad-bind-credentials \
+     --namespace authentication \
+     --from-literal=AD_BIND_PASSWORD='SENHA_REAL_DA_CONTA_ADM_YURI'
+   ```
+   Sem esse Secret, o passo correspondente na pipeline é pulado
+   (não derruba o resto do deploy) — crie-o e rode o workflow de novo
+   (ou aguarde o próximo push) para ativar a federação.
 
-> ℹ️ **Sobre a integração com Active Directory (decisão tomada):** o
-> Keycloak que já roda hoje fora do K3s tem variáveis `AD_DOMAIN`,
-> `AD_DC_HOSTNAME` e `AD_DC_IP` no seu `.env`, indicando federação com o
-> AD (`rondonopolis.local`, `dc01.rondonopolis.local`). Essa configuração
-> normalmente envolve um provider LDAP montado via Admin Console/REST API
-> (com credenciais de bind que não vêm em variável de ambiente), então
-> optamos por **não tentar recriar isso às cegas neste repositório**. A
-> stack sobe com gestão de usuários local (banco Postgres) e, depois que o
-> Keycloak novo estiver no ar, a federação com o AD é configurada
-> manualmente pelo Admin Console — mesmo processo de sempre, só que
-> apontando para este Keycloak em vez do que roda fora do K3s hoje.
-> Caminho: **Realm → User federation → Add provider → ldap**, usando os
-> mesmos dados de conexão (`AD_DC_HOSTNAME`/`AD_DC_IP`, porta 389/636,
-> Base DN, etc.) e a credencial de bind que já está em uso no ambiente
-> atual.
+> ⚠️ **Duas pendências conhecidas na integração com o AD** (documentadas
+> em detalhe no cabeçalho de `ldap-federation-job.yaml`):
+> 1. **Conexão sem criptografia (LDAP, porta 389)**: testado direto contra
+>    o Domain Controller (`192.168.0.101`) — nem LDAPS (636) nem StartTLS
+>    completam o handshake TLS (falta certificado configurado no serviço
+>    LDAP do Windows Server). Decisão consciente: seguir sem criptografia
+>    por enquanto. Assim que o time de infra configurar um certificado no
+>    DC, troque `AD_CONNECTION_URL` para `ldaps://192.168.0.101:636` no
+>    Job.
+> 2. **Conta de bind administrativa** (`adm.yuri`): usar uma conta admin
+>    do domínio para consultas de LDAP não é o ideal — o ambiente mais
+>    seguro usaria uma conta de serviço dedicada, só leitura. Funcional
+>    como está, mas vale trocar quando possível (só editar `AD_BIND_DN`
+>    em `secrets.yaml` e recriar o Secret `ad-bind-credentials` com a
+>    senha da nova conta).
 
 ### 4.7. Disparar o primeiro deploy
 
@@ -375,12 +387,15 @@ extra de configuração de borda.
 
 ## 6. Próximos passos recomendados (fora do escopo inicial)
 
-- **Federação com o Active Directory (`rondonopolis.local`)**: decisão
-  tomada de configurar manualmente pelo Admin Console depois do deploy,
-  em vez de automatizar às cegas (ver nota completa na seção 4.6) — é o
-  item de maior impacto antes de esta stack poder substituir o Keycloak
-  atual em produção, já que sem ela os usuários da prefeitura não
-  logariam com a conta do domínio.
+- **Certificado LDAPS no Domain Controller**: a federação com o AD já está
+  automatizada (`ldap-federation-job.yaml`), mas roda hoje sem
+  criptografia (LDAP, porta 389) porque o DC não tem certificado
+  configurado para o serviço LDAP — pedir ao time que administra o AD
+  para configurar isso, e então trocar a URL de conexão para
+  `ldaps://192.168.0.101:636`.
+- **Conta de bind dedicada para o AD**: hoje usa uma conta administrativa
+  (`adm.yuri`) por conveniência — trocar por uma conta de serviço só
+  leitura assim que possível (ver seção 4.6).
 - **Sealed Secrets / SOPS**: para versionar segredos criptografados no Git
   em vez de texto plano (ver aviso detalhado em `secrets.yaml`).
 - **Backup off-site**: o CronJob já grava backups diários no disco da VM,

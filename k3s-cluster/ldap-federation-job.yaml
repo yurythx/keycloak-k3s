@@ -1,0 +1,277 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/ldap-federation-job.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Automatizar (via `kcadm.sh`, a CLI de administração que já vem dentro da
+#   imagem oficial do Keycloak) os dois passos que, de outra forma, alguém
+#   teria que fazer manualmente pelo Admin Console a cada vez que o cluster
+#   fosse recriado do zero:
+#     1. Criar o Realm "rondonopolis" (onde os sistemas da prefeitura vão
+#        autenticar — mantendo o realm "master" reservado só para
+#        administração do próprio Keycloak, boa prática de segurança).
+#     2. Criar o provider de federação LDAP dentro desse Realm, apontando
+#        para o Active Directory da prefeitura (rondonopolis.local).
+#
+#   O Job é TOTALMENTE IDEMPOTENTE: o script verifica se o Realm e o
+#   provider já existem antes de criar — pode ser reaplicado quantas vezes
+#   quiser (inclusive a cada deploy da pipeline) sem duplicar nada nem falhar.
+#
+# ⚠️ POR QUE A SENHA DA CONTA DO AD NÃO ESTÁ EM NENHUM ARQUIVO VERSIONADO
+#   A conta usada aqui (`adm.yuri`, ver AD_BIND_DN em `secrets.yaml`) é uma
+#   conta ADMINISTRATIVA DO DOMÍNIO — bem mais sensível que qualquer outra
+#   credencial desta stack (um vazamento afeta o Active Directory inteiro
+#   da prefeitura, não só este cluster). Por isso a senha dela vive em um
+#   Secret SEPARADO (`ad-bind-credentials`), que NENHUM manifesto deste
+#   repositório cria — você precisa criá-lo manualmente, uma única vez,
+#   DIRETO no cluster (nunca commitado):
+#
+#     kubectl create secret generic ad-bind-credentials \
+#       --namespace authentication \
+#       --from-literal=AD_BIND_PASSWORD='SENHA_REAL_DA_CONTA_ADM_YURI'
+#
+#   Depois de criado uma vez, este Job (e a pipeline, que reaplica este
+#   arquivo a cada deploy) continuam funcionando normalmente — ninguém
+#   além de quem tem acesso ao cluster jamais vê essa senha em texto
+#   claro fora dele. Se precisar trocar a senha desta conta no AD no
+#   futuro, rode o mesmo comando acima de novo (ele substitui o Secret
+#   existente) e depois: `kubectl delete job ldap-federation-setup -n
+#   authentication` seguido de `kubectl apply -f k3s-cluster/ldap-federation-job.yaml`
+#   (o deploy.yml já faz isso automaticamente a cada execução).
+#
+# ⚠️ SOBRE A CONEXÃO SER LDAP SEM CRIPTOGRAFIA (porta 389, não 636/LDAPS)
+#   Testado diretamente contra o Domain Controller (192.168.0.101): nem
+#   LDAPS (636) nem StartTLS (389) completam o handshake TLS — o
+#   Domain Controller não tem certificado configurado para o serviço LDAP
+#   (`openssl s_client` recebe RST logo após o ClientHello; `ldapsearch -ZZ`
+#   retorna "Error initializing SSL/TLS"). Isso é uma configuração pendente
+#   do lado do Windows Server/AD (instalar um certificado no serviço LDAP),
+#   fora do alcance deste repositório. DECISÃO CONSCIENTE tomada: seguir
+#   com LDAP em texto plano por enquanto — o que significa que a senha da
+#   conta `adm.yuri` trafega SEM criptografia na rede interna a cada
+#   sincronização do Keycloak com o AD. Prioridade recomendada para
+#   quando possível: (1) instalar certificado no DC e migrar
+#   `connectionUrl` para `ldaps://192.168.0.101:636`, (2) trocar a conta
+#   de bind para uma conta de serviço só-leitura, dedicada (não
+#   administrativa).
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ldap-federation-setup
+  namespace: authentication
+
+spec:
+  backoffLimit: 2
+  # ↑ Tenta até 2 vezes antes de desistir — cobre instabilidades passageiras
+  #   (ex.: Keycloak ainda terminando de subir) sem ficar tentando para sempre.
+
+  activeDeadlineSeconds: 300
+  # ↑ Mata o Job se ele travar por mais de 5 minutos — evita um Job
+  #   "pendurado" bloqueando `kubectl` ou consumindo recursos indefinidamente.
+
+  template:
+    spec:
+      restartPolicy: OnFailure
+      # ↑ Jobs não aceitam `Always` — `OnFailure` deixa o Kubernetes tentar
+      #   de novo (respeitando o `backoffLimit` acima) se o script falhar.
+
+      containers:
+        - name: kcadm-setup
+          image: quay.io/keycloak/keycloak:26.0
+          # ↑ MESMA imagem do Keycloak em si — não precisa de nenhuma imagem
+          #   extra, pois o `kcadm.sh` (CLI de administração) já vem
+          #   embutido em /opt/keycloak/bin/kcadm.sh nesta imagem oficial.
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # ↑ Aborta no primeiro erro — evita o script seguir adiante
+              #   com o Realm/provider num estado parcialmente configurado.
+
+              KCADM=/opt/keycloak/bin/kcadm.sh
+
+              echo ">> Aguardando o Keycloak responder antes de configurar..."
+              for i in $(seq 1 30); do
+                if curl -sf "http://keycloak:8080/realms/master" > /dev/null; then
+                  echo ">> Keycloak respondeu, prosseguindo."
+                  break
+                fi
+                echo "   tentativa $i/30, aguardando 10s..."
+                sleep 10
+                if [ "$i" -eq 30 ]; then
+                  echo "ERRO: Keycloak não respondeu a tempo." >&2
+                  exit 1
+                fi
+              done
+
+              echo ">> Autenticando no realm master via kcadm.sh..."
+              "$KCADM" config credentials \
+                --server http://keycloak:8080 \
+                --realm master \
+                --user "$KC_ADMIN_USER" \
+                --password "$KC_ADMIN_PASSWORD"
+              # ↑ Usa as MESMAS credenciais do admin do Keycloak já
+              #   configuradas em secrets.yaml (KC_BOOTSTRAP_ADMIN_USERNAME/
+              #   PASSWORD) — nenhuma credencial nova precisa ser criada só
+              #   para este Job.
+
+              echo ">> Verificando se o realm '$TARGET_REALM' já existe..."
+              if "$KCADM" get "realms/$TARGET_REALM" > /dev/null 2>&1; then
+                echo "   Realm '$TARGET_REALM' já existe — pulando criação."
+              else
+                echo "   Criando realm '$TARGET_REALM'..."
+                "$KCADM" create realms -s realm="$TARGET_REALM" -s enabled=true
+              fi
+
+              echo ">> Descobrindo o ID interno do realm (necessário para o parentId do provider)..."
+              REALM_ID=$("$KCADM" get "realms/$TARGET_REALM" --fields id --format csv --noquotes)
+              echo "   ID interno: $REALM_ID"
+
+              echo ">> Verificando se o provider LDAP '$LDAP_PROVIDER_NAME' já existe neste realm..."
+              EXISTING_ID=$("$KCADM" get components -r "$TARGET_REALM" \
+                -q "name=$LDAP_PROVIDER_NAME" \
+                -q "type=org.keycloak.storage.UserStorageProvider" \
+                --fields id --format csv --noquotes 2>/dev/null | tail -n +1 || true)
+
+              if [ -n "$EXISTING_ID" ]; then
+                echo "   Provider '$LDAP_PROVIDER_NAME' já existe (id=$EXISTING_ID) — pulando criação."
+                echo "   (Para reconfigurar do zero: apague pelo Admin Console e reaplique este Job.)"
+              else
+                echo "   Criando provider LDAP '$LDAP_PROVIDER_NAME'..."
+                "$KCADM" create components -r "$TARGET_REALM" \
+                  -s name="$LDAP_PROVIDER_NAME" \
+                  -s providerId=ldap \
+                  -s providerType=org.keycloak.storage.UserStorageProvider \
+                  -s parentId="$REALM_ID" \
+                  -s 'config.enabled=["true"]' \
+                  -s 'config.vendor=["ad"]' \
+                  -s "config.connectionUrl=[\"$AD_CONNECTION_URL\"]" \
+                  -s "config.usersDn=[\"$AD_USERS_DN\"]" \
+                  -s "config.authType=[\"simple\"]" \
+                  -s "config.bindDn=[\"$AD_BIND_DN\"]" \
+                  -s "config.bindCredential=[\"$AD_BIND_PASSWORD\"]" \
+                  -s 'config.usernameLDAPAttribute=["sAMAccountName"]' \
+                  -s 'config.rdnLDAPAttribute=["cn"]' \
+                  -s 'config.uuidLDAPAttribute=["objectGUID"]' \
+                  -s 'config.userObjectClasses=["person, organizationalPerson, user"]' \
+                  -s 'config.searchScope=["2"]' \
+                  -s 'config.editMode=["READ_ONLY"]' \
+                  -s 'config.syncRegistrations=["false"]' \
+                  -s 'config.importEnabled=["true"]' \
+                  -s 'config.pagination=["true"]'
+                echo "   Provider criado com sucesso."
+              fi
+
+              echo ">> Concluído."
+          # ↑ Fim do script. Nota sobre os campos do provider (todos com
+          #   comentário porque cada um foi verificado antes de usar, não
+          #   assumido às cegas — esta configuração já causou retrabalho
+          #   demais nesta stack quando adivinhada):
+          #     vendor=ad                -> ativa os padrões corretos do
+          #                                 Active Directory (o Keycloak
+          #                                 tem lógica especial por vendor).
+          #     usernameLDAPAttribute    -> sAMAccountName é o atributo
+          #                                 padrão de login no AD (ex.: o
+          #                                 "adm.yuri" que já confirmamos).
+          #     uuidLDAPAttribute        -> objectGUID é o identificador
+          #                                 único e IMUTÁVEL de cada objeto
+          #                                 no AD (diferente do OpenLDAP,
+          #                                 que usa entryUUID).
+          #     searchScope=2            -> SUBTREE: procura o usuário em
+          #                                 QUALQUER profundidade de OUs
+          #                                 abaixo do usersDn — necessário
+          #                                 aqui, já que os usuários ficam
+          #                                 vários níveis abaixo (ver
+          #                                 AD_BIND_DN em secrets.yaml).
+          #     editMode=READ_ONLY       -> Keycloak nunca tenta ESCREVER
+          #                                 de volta no AD (ex.: trocar
+          #                                 senha) — mudanças de senha
+          #                                 continuam sendo feitas pelos
+          #                                 canais normais do AD.
+          #     importEnabled=true       -> Keycloak guarda uma cópia local
+          #                                 dos dados do usuário após o
+          #                                 primeiro login/sync (performance
+          #                                 — evita bater no AD toda hora).
+
+          env:
+            - name: KC_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: KC_BOOTSTRAP_ADMIN_USERNAME
+
+            - name: KC_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: KC_BOOTSTRAP_ADMIN_PASSWORD
+
+            - name: AD_BIND_DN
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: AD_BIND_DN
+
+            - name: AD_BIND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ad-bind-credentials
+                  # ↑ Secret SEPARADO, criado manualmente uma única vez
+                  #   direto no cluster (ver aviso no topo deste arquivo) —
+                  #   NENHUM manifesto deste repositório cria este Secret,
+                  #   de propósito, para a senha real nunca precisar
+                  #   existir em nenhum arquivo versionado no Git.
+                  key: AD_BIND_PASSWORD
+
+            - name: TARGET_REALM
+              value: "rondonopolis"
+              # ↑ Nome do Realm onde a federação é configurada. Trocar
+              #   aqui se um dia o nome do realm mudar.
+
+            - name: LDAP_PROVIDER_NAME
+              value: "ad-rondonopolis"
+              # ↑ Nome de exibição do provider dentro do Admin Console
+              #   (Realm rondonopolis → User federation).
+
+            - name: AD_CONNECTION_URL
+              value: "ldap://192.168.0.101:389"
+              # ↑ ⚠️ LDAP SEM CRIPTOGRAFIA — ver aviso completo no topo
+              #   deste arquivo sobre por que LDAPS/StartTLS não funcionam
+              #   ainda neste Domain Controller. Existe um segundo DC em
+              #   192.168.0.102 (mesmo domínio) — não usado aqui por
+              #   simplicidade, mas disponível para redundância futura.
+
+            - name: AD_USERS_DN
+              value: "DC=rondonopolis,DC=local"
+              # ↑ Base DN de busca — a raiz do domínio principal
+              #   (confirmado via consulta anônima ao rootDSE do AD, não
+              #   adivinhado). Existem subdomínios/OUs de outras
+              #   secretarias (saude., educacao., semed., etc.) que ficam
+              #   FORA deste Base DN — se um dia for preciso federar
+              #   usuários dessas secretarias também, este valor precisa
+              #   ser revisado (múltiplos Base DNs exigiriam múltiplos
+              #   providers LDAP, um por domínio).
+
+          resources:
+            # ↑ O Job roda por segundos, uma vez (ou raramente) — recursos
+            #   mínimos, só o suficiente para o kcadm.sh e o curl rodarem.
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+# ==============================================================================
+# COMO VALIDAR SE FUNCIONOU:
+#   kubectl logs -n authentication job/ldap-federation-setup
+#   # Depois, pelo Admin Console: Realm "rondonopolis" -> User federation ->
+#   # deve aparecer "ad-rondonopolis" -> botão "Synchronize all users" para
+#   # trazer os usuários do AD para dentro do Keycloak pela primeira vez.
+#
+# COMO TESTAR UM LOGIN:
+#   Acesse https://sso.rondonopolis.mt.gov.br/realms/rondonopolis/account
+#   e tente logar com um usuário real do AD (ex.: o sAMAccountName dele).
+# ==============================================================================
