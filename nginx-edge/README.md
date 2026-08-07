@@ -1,48 +1,67 @@
-# Configuração de referência para o Nginx da borda
+# Configuração de referência para o Nginx da borda (aaPanel/BT Panel)
 
-Esta pasta **não é aplicada no cluster K3s** (o Nginx da borda não roda
-dentro do Kubernetes — ele é o servidor isolado já existente na rede da
-prefeitura). Os dois arquivos aqui são apenas **referência**, prontos para
-você copiar/adaptar dentro da configuração que já existe nesse servidor
-(ex.: dentro de `/etc/nginx/sites-available/`, `/etc/nginx/conf.d/`, ou onde
-quer que o padrão de vhosts de vocês já esteja organizado).
+Esta pasta **não é aplicada no cluster K3s** — o Nginx da borda é o
+servidor isolado já existente na rede da prefeitura (aaPanel/BT Panel, IP
+`192.168.0.218`), gerenciado fora deste repositório. Os arquivos aqui são
+uma **cópia próxima do que está de fato no servidor**, com apenas os
+trechos necessários para apontar para o novo K3s marcados como alterados —
+não configs genéricas.
 
-| Arquivo | Domínio | Aponta para (dentro do K3s) |
+| Arquivo | Domínio | Situação |
 |---|---|---|
-| `sso.rondonopolis.mt.gov.br.conf` | Keycloak | Traefik → Service `keycloak` |
-| `cofre.rondonopolis.mt.gov.br.conf` | Vaultwarden | Traefik → Service `vaultwarden` |
+| `sso.rondonopolis.mt.gov.br.conf` | Keycloak | **Já existe** no servidor — hoje aponta para o Keycloak antigo (porta 18443); o diff necessário está marcado com `# ALTERADO:` / `# NOVO:` |
+| `cofre.rondonopolis.mt.gov.br.conf` | Vaultwarden | **Site novo** — precisa ser criado no painel primeiro (ver instruções no topo do arquivo) |
 
 ## Rede desta instalação
 
 | Servidor | IP interno |
 |---|---|
-| VM do K3s | `192.168.0.225` |
-| Nginx da borda (este servidor) | `192.168.0.218` |
+| VM do K3s (mesma VM que já hospeda o Keycloak antigo, porta 18443) | `192.168.0.225` |
+| Nginx da borda / aaPanel (este servidor) | `192.168.0.218` |
 
-Os dois arquivos `.conf` já apontam para `192.168.0.225:80` — os dois
-domínios vão para a **mesma VM**, na **mesma porta 80**; é o Traefik,
-dentro do cluster, quem decide para qual aplicação (Keycloak ou
-Vaultwarden) encaminhar, com base no `Host` que o Nginx repassa. Se o IP da
-VM mudar no futuro, atualize os dois arquivos aqui.
+## Como aplicar
 
-## O que você PRECISA ajustar antes de usar
+**`sso.rondonopolis.mt.gov.br`** (site já existe): no painel, vá em
+Website → sso.rondonopolis.mt.gov.br → **Config Files** (ou edite o
+arquivo diretamente em
+`/www/server/panel/vhost/nginx/sso.rondonopolis.mt.gov.br.conf`), localize
+o bloco `#PROXY-CONF-START ... #PROXY-CONF-END` e aplique as duas mudanças
+marcadas no arquivo local: trocar a porta do `proxy_pass` de `18443` para
+`80`, e adicionar as duas linhas de `X-Forwarded-Proto`/`X-Forwarded-Host`.
+Depois: `nginx -t && systemctl reload nginx` (ou o botão "Reload" do
+painel).
 
-Os caminhos de certificado (`ssl_certificate` / `ssl_certificate_key`) estão
-com placeholders — ajuste para onde o seu Nginx já guarda os certificados
-reais desses domínios (Let's Encrypt/certbot, certificado da prefeitura,
-etc.). Isso já é gerenciado por vocês fora deste repositório.
+**`cofre.rondonopolis.mt.gov.br`** (site novo): siga as instruções no
+cabeçalho do arquivo `cofre.rondonopolis.mt.gov.br.conf` — criar o site
+pelo painel, emitir o certificado Let's Encrypt pela aba SSL, e então
+aplicar o bloco de proxy reverso (o arquivo aqui serve de conferência).
+
+## ⚠️ Sobre editar direto vs. usar a interface gráfica do painel
+
+Se você usar a ferramenta gráfica **"Proxy Reverso"** do aaPanel nas
+configurações de um desses sites depois de aplicar estes ajustes, ela
+**regenera o bloco `#PROXY-CONF-START ... #PROXY-CONF-END` sozinha** —
+os cabeçalhos extras (`X-Forwarded-Proto`, `X-Forwarded-Host`) seriam
+perdidos nesse caso. Se precisar usar a interface gráfica de novo no
+futuro, reaplique essas duas linhas manualmente depois.
 
 ## Por que os cabeçalhos `X-Forwarded-*` importam aqui
 
 O Keycloak e o Vaultwarden, dentro do K3s, só recebem tráfego HTTP puro do
-Traefik — eles não "veem" HTTPS diretamente. Para saberem que o usuário
-final acessou via HTTPS (essencial para gerar URLs corretas e cookies
-seguros), o Nginx precisa enviar os cabeçalhos `X-Forwarded-Proto`,
-`X-Forwarded-Host` e `X-Forwarded-For` — já incluídos nos dois arquivos
-abaixo. Do lado do cluster, o arquivo
-`k3s-cluster/traefik-trusted-headers.yaml` precisa estar configurado com o
-IP deste Nginx para que o Traefik CONFIE nesses cabeçalhos em vez de
-sobrescrevê-los — os dois lados (Nginx + Traefik) têm que estar alinhados.
+Traefik — eles não "veem" HTTPS diretamente. `X-Forwarded-Proto: https`
+avisa que a conexão original do usuário foi HTTPS. Do lado do cluster, o
+arquivo `k3s-cluster/traefik-trusted-headers.yaml` já está configurado com
+o IP deste Nginx (`192.168.0.218`) para que o Traefik CONFIE nesses
+cabeçalhos em vez de sobrescrevê-los.
+
+## Sobre o cutover do Keycloak antigo para o novo
+
+O Keycloak antigo (bare-metal/Docker, porta 18443) e o novo (K3s, porta 80)
+podem rodar ao mesmo tempo na mesma VM sem conflito de porta — útil
+durante os testes. Mas os dois juntos disputam RAM na VM de 8GB. Depois de
+validar que o Keycloak novo está funcionando bem (login, redirect,
+sessões), pare os containers do Keycloak antigo antes de considerar a
+migração definitiva.
 
 ## Testando depois de configurar
 

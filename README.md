@@ -307,10 +307,14 @@ precisa de atenção:
    usuário administrador (`kc_admin`) e usuário de banco (`keycloak_user`)
    já usados no Keycloak que roda hoje fora do K3s, para manter consistência
    — só as SENHAS precisam ser reais/fortes, os nomes de usuário já batem.
-2. Copie os arquivos de `nginx-edge/*.conf` para dentro da configuração já
-   existente do seu Nginx, ajustando os caminhos dos certificados TLS
-   (`ssl_certificate`/`ssl_certificate_key`) para os que o Nginx já usa —
-   o `proxy_pass` já aponta para o IP correto desta VM.
+2. No painel aaPanel/BT Panel do Nginx da borda: para `sso.` (site já
+   existe), é só trocar a porta do `proxy_pass` de `18443` para `80` e
+   adicionar 2 linhas de cabeçalho — o diff exato está marcado com
+   `# ALTERADO:`/`# NOVO:` em `nginx-edge/sso.rondonopolis.mt.gov.br.conf`.
+   Para `cofre.` (site novo), siga o passo a passo no topo de
+   `nginx-edge/cofre.rondonopolis.mt.gov.br.conf` (criar o site no painel
+   + emitir SSL antes de aplicar o proxy reverso). Detalhes completos em
+   `nginx-edge/README.md`.
 3. Aponte os registros DNS tipo **A** de `sso.rondonopolis.mt.gov.br` e
    `cofre.rondonopolis.mt.gov.br` para o **IP público** do Nginx da borda
    (não o IP interno `192.168.0.218` — esse é só para a rede local).
