@@ -159,16 +159,23 @@ spec:
           #   100% baseada em Quarkus (start-up rápido, baixo consumo de RAM
           #   comparado ao antigo Keycloak baseado em WildFly).
 
-          args: ["start", "--optimized"]
+          args: ["start"]
           # ↑ "start" inicia o Keycloak em modo de produção (diferente de
           #   "start-dev", que é só para testes locais e NÃO deve ser usado
-          #   aqui). "--optimized" pula a fase de "build" a cada boot,
-          #   assumindo que a imagem já foi previamente otimizada — a imagem
-          #   oficial do Keycloak já vem pré-otimizada para configurações
-          #   padrão, então isso acelera bastante o tempo de start do Pod.
-          #   Se você adicionar temas/plugins customizados via Dockerfile
-          #   próprio, rode `kc.sh build` no build da imagem antes de usar
-          #   esta flag.
+          #   aqui). NÃO usamos "--optimized": essa flag só é válida quando
+          #   a imagem foi previamente processada com `kc.sh build` dentro
+          #   de um Dockerfile customizado (gera uma imagem "otimizada",
+          #   travando a configuração em tempo de build). A imagem OFICIAL
+          #   "crua" (`quay.io/keycloak/keycloak:26.0`, usada aqui) NÃO vem
+          #   pré-otimizada — usar "--optimized" nela falha com o erro
+          #   "The '--optimized' flag was used for first ever server start"
+          #   e o container entra em CrashLoopBackOff. Sem a flag, o
+          #   Keycloak faz um "auto-build" rápido a cada start (poucos
+          #   segundos a mais) e funciona corretamente com a imagem padrão.
+          #   Se um dia vocês criarem uma imagem customizada (com temas ou
+          #   plugins) via Dockerfile próprio rodando `kc.sh build` no
+          #   build da imagem, aí sim "--optimized" pode ser reativado para
+          #   acelerar o boot.
 
           ports:
             - name: http

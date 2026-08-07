@@ -51,11 +51,22 @@ name: Deploy Auth Stack para o K3s
 concurrency:
   group: deploy-producao
   # ↑ Agrupa todas as execuções deste workflow sob a mesma "fila" chamada
-  #   "deploy-producao".
-  cancel-in-progress: false
-  # ↑ Se dois pushes chegarem em sequência rápida, o segundo AGUARDA o
-  #   primeiro terminar (não cancela um deploy em andamento) — evita dois
-  #   `kubectl apply` rodando ao mesmo tempo e brigando pelo mesmo cluster.
+  #   "deploy-producao" — o GitHub nunca deixa 2 execuções deste grupo
+  #   rodarem ao mesmo tempo, independente do valor de cancel-in-progress
+  #   abaixo (isso sozinho já evita dois `kubectl apply` brigando pelo
+  #   mesmo cluster simultaneamente).
+  cancel-in-progress: true
+  # ↑ Se um push novo chegar enquanto OUTRO deploy anterior ainda está
+  #   rodando (ou apenas enfileirado, esperando um runner ficar livre), o
+  #   mais antigo é CANCELADO na hora, e só o mais recente prossegue.
+  #   IMPORTANTE: já vivemos o cenário oposto (cancel-in-progress: false)
+  #   na prática — o runner ficou offline por um tempo enquanto vários
+  #   commits eram enviados, e quando finalmente entrou no ar, processou
+  #   TODOS os deploys enfileirados em sequência, do mais antigo (com
+  #   manifestos já desatualizados) até o mais novo, desperdiçando minutos
+  #   reaplicando estados intermediários que nem interessam mais — o
+  #   `kubectl apply` sendo idempotente torna seguro simplesmente pular
+  #   direto para o estado mais recente.
 
 permissions:
   contents: read
