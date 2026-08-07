@@ -1,0 +1,177 @@
+# ==============================================================================
+# ARQUIVO: .github/workflows/deploy.yml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Pipeline de GitOps: toda vez que um commit chega na branch "main", este
+#   workflow se conecta ao Runner AUTO-HOSPEDADO (instalado dentro da própria
+#   VM do K3s) e aplica os manifestos do Kubernetes NA ORDEM CORRETA.
+#
+# POR QUE SELF-HOSTED RUNNER (E NÃO O RUNNER PADRÃO DA GITHUB)?
+#   Os runners padrão do GitHub ("ubuntu-latest") rodam em máquinas efêmeras
+#   NA NUVEM da GitHub — para eles conseguirem aplicar manifestos no nosso
+#   K3s, precisaríamos expor a API do Kubernetes (porta 6443) ou o SSH da VM
+#   para a internet, o que é um risco de segurança inaceitável para uma
+#   stack de autenticação governamental.
+#
+#   Com um runner SELF-HOSTED, o agente do GitHub Actions roda DENTRO da
+#   própria VM e é ELE quem inicia uma conexão de SAÍDA (outbound) para os
+#   servidores da GitHub buscar trabalho — nenhuma porta de entrada
+#   (inbound) precisa ser aberta no firewall da prefeitura. É o runner que
+#   "puxa" o trabalho, e não a GitHub que "empurra" para dentro da rede.
+# ==============================================================================
+
+name: Deploy Auth Stack para o K3s
+# ↑ Nome do workflow, exibido na aba "Actions" do repositório no GitHub.
+
+"on":
+  # ↑ Bloco que define QUANDO este workflow deve ser disparado.
+  #   (Colocado entre aspas de propósito: em YAML 1.1 a palavra "on" sem
+  #   aspas pode ser interpretada como o booleano `true` por alguns parsers
+  #   estritos — o GitHub Actions lida bem com ambas as formas, mas aspas
+  #   aqui removem qualquer ambiguidade para outras ferramentas de lint.)
+  push:
+    branches:
+      - main
+      # ↑ Só executa em PUSH (commit direto ou merge de PR) na branch
+      #   "main" — é o gatilho clássico de GitOps: "main" é sempre o
+      #   reflexo fiel do que está rodando em produção.
+    paths:
+      - "k3s-cluster/**"
+      # ↑ Só dispara se algum arquivo dentro de "k3s-cluster/" mudar...
+      - ".github/workflows/deploy.yml"
+      # ↑ ...ou se o próprio workflow for alterado. Evita rodar o deploy à
+      #   toa quando, por exemplo, só o README.md é editado.
+
+  workflow_dispatch:
+    # ↑ Permite também disparar este workflow MANUALMENTE pela interface do
+    #   GitHub (botão "Run workflow") ou via `gh workflow run deploy.yml` —
+    #   útil para reaplicar os manifestos sem precisar de um commit novo
+    #   (ex.: depois de trocar uma senha diretamente no cluster por engano).
+
+concurrency:
+  group: deploy-producao
+  # ↑ Agrupa todas as execuções deste workflow sob a mesma "fila" chamada
+  #   "deploy-producao".
+  cancel-in-progress: false
+  # ↑ Se dois pushes chegarem em sequência rápida, o segundo AGUARDA o
+  #   primeiro terminar (não cancela um deploy em andamento) — evita dois
+  #   `kubectl apply` rodando ao mesmo tempo e brigando pelo mesmo cluster.
+
+permissions:
+  contents: read
+  # ↑ O workflow só precisa de permissão de LEITURA sobre o código do
+  #   repositório (para fazer checkout) — Princípio do Menor Privilégio.
+  #   Não escrevemos nada de volta no repositório, então não concedemos
+  #   permissão de escrita ao GITHUB_TOKEN automático.
+
+jobs:
+  # ↑ Um workflow é composto por um ou mais "jobs" (tarefas independentes).
+  #   Temos apenas um job aqui: aplicar os manifestos no cluster.
+
+  aplicar-manifestos:
+    # ↑ Identificador interno deste job (aparece nos logs e na URL da execução).
+
+    runs-on: self-hosted
+    # ↑ ⭐ O CORAÇÃO DA SEGURANÇA DESTE PIPELINE ⭐
+    #   Em vez de "ubuntu-latest" (máquina da GitHub), usamos "self-hosted"
+    #   para rodar este job DENTRO da própria VM K3s da prefeitura — o
+    #   `kubectl` já está local, autenticado no cluster local, sem precisar
+    #   trafegar credenciais de acesso pela internet.
+    #   (Veja o README.md para o passo a passo de registro do runner.)
+
+    timeout-minutes: 10
+    # ↑ Mata o job automaticamente se travar por mais de 10 minutos — evita
+    #   que uma pipeline "pendurada" bloqueie a fila de deploys para sempre.
+
+    steps:
+      # ↑ Lista ORDENADA de passos executados sequencialmente dentro do job.
+      #   Se qualquer passo falhar (exit code != 0), os passos seguintes NÃO
+      #   rodam e o workflow inteiro é marcado como falho.
+
+      - name: 1. Fazer checkout do código-fonte
+        uses: actions/checkout@v4
+        # ↑ Ação oficial da GitHub que clona o repositório (na revisão exata
+        #   do commit que disparou o workflow) para dentro do workspace
+        #   local do runner self-hosted, para que os arquivos .yaml existam
+        #   fisicamente em disco e possam ser lidos pelo `kubectl apply`.
+
+      - name: 2. Validar acesso ao cluster K3s
+        run: kubectl cluster-info
+        # ↑ Passo de sanidade: confirma que o runner consegue "enxergar" o
+        #   cluster ANTES de tentar aplicar qualquer coisa. Se o K3s
+        #   estiver fora do ar ou o kubeconfig estiver mal configurado no
+        #   runner, o pipeline falha AQUI, com uma mensagem de erro clara,
+        #   em vez de falhar de forma confusa nos passos seguintes.
+
+      - name: 3. Aplicar Namespace
+        run: kubectl apply -f k3s-cluster/namespaces.yaml
+        # ↑ SEMPRE o primeiro manifesto: cria o namespace "authentication"
+        #   onde todos os demais recursos vão residir. Se este passo não
+        #   rodar primeiro, os passos seguintes falham com erro
+        #   "namespaces authentication not found".
+
+      - name: 4. Aplicar Secrets (credenciais)
+        run: kubectl apply -f k3s-cluster/secrets.yaml
+        # ↑ Aplicado logo em seguida, pois o PostgreSQL, o Keycloak e o
+        #   Vaultwarden (próximos passos) dependem destas credenciais via
+        #   `secretKeyRef` para conseguirem sequer INICIAR.
+
+      - name: 5. Aplicar PostgreSQL (PVC + Deployment + Service)
+        run: kubectl apply -f k3s-cluster/postgres-db.yaml
+        # ↑ O arquivo postgres-db.yaml já contém o PVC (disco), o Deployment
+        #   e o Service num único apply — o Kubernetes cria os 3 objetos na
+        #   ordem correta internamente (PVC antes do Pod que o consome).
+
+      - name: 6. Aguardar o PostgreSQL ficar pronto
+        run: |
+          kubectl rollout status deployment/postgres \
+            -n authentication --timeout=120s
+        # ↑ `rollout status` BLOQUEIA a pipeline até o Deployment do
+        #   Postgres reportar todas as réplicas prontas (readinessProbe OK)
+        #   — ou falhar após 120s. Fundamental: subir o Keycloak ANTES do
+        #   banco estar realmente pronto faria os Pods dele entrarem em
+        #   CrashLoopBackOff nas primeiras tentativas de conexão.
+
+      - name: 7. Aplicar Keycloak (RBAC + Deployment + Service)
+        run: kubectl apply -f k3s-cluster/keycloak.yaml
+        # ↑ Cria a ServiceAccount/Role/RoleBinding (necessárias para o
+        #   clustering via KUBE_PING) e o Deployment com as 2 réplicas do
+        #   Keycloak, já apontando para o Postgres (que garantimos estar
+        #   pronto no passo anterior).
+
+      - name: 8. Aplicar Vaultwarden (PVC + Deployment + Service)
+        run: kubectl apply -f k3s-cluster/vaultwarden.yaml
+        # ↑ O cofre de senhas é independente do Postgres/Keycloak (usa seu
+        #   próprio SQLite embutido), então pode subir em paralelo
+        #   conceitualmente — mas mantemos sequencial por simplicidade e
+        #   clareza de logs.
+
+      - name: 9. Aguardar Keycloak e Vaultwarden ficarem prontos
+        run: |
+          kubectl rollout status deployment/keycloak \
+            -n authentication --timeout=180s
+          kubectl rollout status deployment/vaultwarden \
+            -n authentication --timeout=120s
+        # ↑ O Keycloak pode demorar mais para subir (até 3 minutos) na
+        #   primeira execução, pois cria o schema do banco e o Master Realm
+        #   — daí o timeout maior aqui em relação ao Vaultwarden.
+
+      - name: 10. Aplicar Ingress (exposição externa via Traefik)
+        run: kubectl apply -f k3s-cluster/ingress.yaml
+        # ↑ ÚLTIMO passo, de propósito: só expomos o tráfego externo depois
+        #   que TODOS os serviços de backend já estão comprovadamente no ar
+        #   e saudáveis — evita que um usuário acesse login.prefeitura.gov.br
+        #   durante o meio de um deploy e receba erro 502/503.
+
+      - name: 11. Resumo final do estado do cluster
+        if: always()
+        # ↑ `if: always()` faz este passo rodar SEMPRE, mesmo se algum passo
+        #   anterior tiver falhado — útil para diagnóstico rápido direto
+        #   nos logs da GitHub Actions, sem precisar acessar a VM via SSH.
+        run: |
+          echo "----- Pods no namespace authentication -----"
+          kubectl get pods -n authentication -o wide
+          echo "----- Services no namespace authentication -----"
+          kubectl get svc -n authentication
+          echo "----- Ingress no namespace authentication -----"
+          kubectl get ingress -n authentication

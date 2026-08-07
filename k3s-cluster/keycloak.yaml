@@ -1,0 +1,385 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/keycloak.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Subir o Keycloak 26+ (baseado em Quarkus, o "Novo Keycloak") com 2
+#   réplicas para alta disponibilidade — se um Pod cair ou for atualizado, o
+#   outro continua atendendo login da prefeitura sem interrupção.
+#
+# RECURSOS DECLARADOS NESTE ARQUIVO (em ordem lógica):
+#   1. ServiceAccount + Role + RoleBinding -> permissão mínima necessária
+#      para os Pods do Keycloak se "enxergarem" entre si via API do
+#      Kubernetes (necessário para clustering/sessões compartilhadas).
+#   2. Deployment (2 réplicas) -> os Pods do Keycloak propriamente ditos.
+#   3. Service (ClusterIP)     -> endereço de rede interno usado pelo Ingress.
+#
+# POR QUE PRECISAMOS DE RBAC (ServiceAccount/Role/RoleBinding) AQUI?
+#   Com 2 réplicas, cada Pod do Keycloak precisa saber da EXISTÊNCIA do outro
+#   para sincronizar cache distribuído (sessões de login, tokens revogados,
+#   etc.) via Infinispan/JGroups. O protocolo de descoberta "KUBE_PING"
+#   (usado quando KC_CACHE_STACK=kubernetes) faz isso perguntando à API do
+#   Kubernetes "quais Pods existem com o rótulo app=keycloak?" — para isso,
+#   o Pod precisa de permissão de LEITURA (get/list/watch) sobre Pods no
+#   namespace. Sem essa permissão, cada réplica ficaria "isolada" e um
+#   usuário logado no Pod A seria deslogado ao cair no Pod B.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1a) ServiceAccount — a "identidade" que os Pods do Keycloak usam para
+#     conversar com a API do Kubernetes
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak-sa
+  # ↑ Nome da identidade de serviço. Referenciado em `spec.serviceAccountName`
+  #   do Deployment, mais abaixo.
+  namespace: authentication
+
+---
+# ------------------------------------------------------------------------------
+# 1b) Role — o "conjunto de permissões" (o que a identidade acima PODE fazer)
+# ------------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+# ↑ Grupo de API responsável por controle de acesso baseado em papéis (RBAC).
+
+kind: Role
+# ↑ "Role" (diferente de "ClusterRole") concede permissões APENAS dentro de
+#   um namespace específico — aplicando o Princípio do Menor Privilégio: o
+#   Keycloak não precisa (e não deve) enxergar Pods de outros namespaces.
+
+metadata:
+  name: keycloak-pod-reader
+  namespace: authentication
+
+rules:
+  - apiGroups: [""]
+    # ↑ "" (string vazia) representa o grupo de API "core" — onde vive o
+    #   recurso "pods".
+    resources: ["pods"]
+    # ↑ Esta permissão vale apenas para o tipo de recurso "Pods".
+    verbs: ["get", "list", "watch"]
+    # ↑ Apenas verbos de LEITURA: consultar um Pod específico (get), listar
+    #   todos (list) e observar mudanças em tempo real (watch). NÃO incluímos
+    #   "create", "delete" ou "update" — o Keycloak jamais precisa alterar
+    #   Pods, apenas descobrir seus IPs para formar o cluster.
+
+---
+# ------------------------------------------------------------------------------
+# 1c) RoleBinding — "conecta" a ServiceAccount à Role (quem recebe a permissão)
+# ------------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keycloak-pod-reader-binding
+  namespace: authentication
+
+subjects:
+  - kind: ServiceAccount
+    name: keycloak-sa
+    # ↑ A quem estamos concedendo a permissão: a ServiceAccount criada acima.
+    namespace: authentication
+
+roleRef:
+  kind: Role
+  name: keycloak-pod-reader
+  # ↑ Qual conjunto de permissões está sendo concedido: a Role definida acima.
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ------------------------------------------------------------------------------
+# 2) Deployment — os Pods do Keycloak (2 réplicas)
+# ------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: authentication
+  labels:
+    app: keycloak
+
+spec:
+  replicas: 2
+  # ↑ Alta disponibilidade: 2 Pods idênticos atendendo login simultaneamente.
+  #   O Traefik/Service faz balanceamento de carga entre eles automaticamente.
+
+  selector:
+    matchLabels:
+      app: keycloak
+
+  strategy:
+    type: RollingUpdate
+    # ↑ Ao atualizar a imagem/config, o Kubernetes troca os Pods GRADUALMENTE
+    #   (um de cada vez), em vez de derrubar tudo e subir de novo — evita
+    #   indisponibilidade do login da prefeitura durante deploys.
+    rollingUpdate:
+      maxUnavailable: 0
+      # ↑ Nunca deixar MENOS de 2 Pods saudáveis no ar durante a atualização
+      #   (zero Pods podem ficar indisponíveis ao mesmo tempo).
+      maxSurge: 1
+      # ↑ Permite subir 1 Pod EXTRA temporariamente (ficando 3 no total por
+      #   um instante) para garantir a troca sem downtime.
+
+  template:
+    metadata:
+      labels:
+        app: keycloak
+        # ↑ Este rótulo é usado por: (a) o Service abaixo, para rotear
+        #   tráfego, e (b) o próprio Keycloak via KUBE_PING, para achar seus
+        #   Pods "irmãos" e formar o cluster de cache distribuído.
+
+    spec:
+      serviceAccountName: keycloak-sa
+      # ↑ Faz os Pods usarem a identidade/permissões criadas na seção 1
+      #   acima, em vez da ServiceAccount "default" (que não tem permissão
+      #   nenhuma) — necessário para o KUBE_PING funcionar.
+
+      # "Anti-affinity": tenta espalhar as 2 réplicas em nós diferentes,
+      # caso o cluster cresça no futuro. Em um cluster single-node (nosso
+      # caso hoje) não tem efeito prático, mas já deixamos preparado.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["keycloak"]
+                topologyKey: kubernetes.io/hostname
+                # ↑ "Prefira" (não exige — é soft) agendar cada réplica em um
+                #   nó (VM) físico diferente, para resiliência a falha de host.
+
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.0
+          # ↑ Imagem OFICIAL do Keycloak, distribuída pelo próprio projeto
+          #   (Quay.io, não Docker Hub), versão 26 — a série "Novo Keycloak"
+          #   100% baseada em Quarkus (start-up rápido, baixo consumo de RAM
+          #   comparado ao antigo Keycloak baseado em WildFly).
+
+          args: ["start", "--optimized"]
+          # ↑ "start" inicia o Keycloak em modo de produção (diferente de
+          #   "start-dev", que é só para testes locais e NÃO deve ser usado
+          #   aqui). "--optimized" pula a fase de "build" a cada boot,
+          #   assumindo que a imagem já foi previamente otimizada — a imagem
+          #   oficial do Keycloak já vem pré-otimizada para configurações
+          #   padrão, então isso acelera bastante o tempo de start do Pod.
+          #   Se você adicionar temas/plugins customizados via Dockerfile
+          #   próprio, rode `kc.sh build` no build da imagem antes de usar
+          #   esta flag.
+
+          ports:
+            - name: http
+              containerPort: 8080
+              # ↑ Porta HTTP interna do Keycloak. Fica atrás do Traefik
+              #   (TLS/HTTPS é terminado no Ingress — ver ingress.yaml), por
+              #   isso rodamos só HTTP aqui dentro do cluster.
+            - name: management
+              containerPort: 9000
+              # ↑ Desde o Keycloak 25+, os endpoints de health/metrics vivem
+              #   numa PORTA DE GERENCIAMENTO separada (9000), isolada da
+              #   porta de aplicação (8080) — mais seguro, pois esses
+              #   endpoints não ficam expostos publicamente pelo Ingress.
+
+          env:
+            # --- Conexão com o banco de dados PostgreSQL ------------------
+            - name: KC_DB
+              value: "postgres"
+              # ↑ Diz ao Keycloak qual dialeto/driver de banco usar.
+
+            - name: KC_DB_URL_HOST
+              value: "postgres"
+              # ↑ Hostname do banco = nome do Service criado em postgres-db.yaml
+              #   (resolução via DNS interno do cluster).
+
+            - name: KC_DB_URL_PORT
+              value: "5432"
+              # ↑ Porta padrão do PostgreSQL (mesma exposta pelo Service).
+
+            - name: KC_DB_URL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: POSTGRES_DB
+              # ↑ Em vez de repetir o valor "keycloak" aqui, lemos DIRETO do
+              #   Secret — se o nome do banco mudar um dia, muda em um único lugar.
+
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: POSTGRES_USER
+
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: POSTGRES_PASSWORD
+                  # ↑ `valueFrom.secretKeyRef` injeta o valor do Secret como
+                  #   variável de ambiente SEM nunca expor a senha em texto
+                  #   plano neste manifesto — só existe dentro do Secret.
+
+            # --- Credenciais do administrador (usadas só no 1º boot) ------
+            - name: KEYCLOAK_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: KEYCLOAK_ADMIN
+
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: KEYCLOAK_ADMIN_PASSWORD
+
+            # --- Hostname público e proxy reverso (Traefik) ----------------
+            - name: KC_HOSTNAME
+              value: "login.prefeitura.gov.br"
+              # ↑ Domínio público pelo qual os usuários acessam o Keycloak.
+              #   Usado para gerar corretamente os links internos (login,
+              #   redirect URIs, emails) — se estiver errado, o Keycloak gera
+              #   URLs quebradas mesmo funcionando "por dentro".
+
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+              # ↑ "false" permite que o Keycloak responda também por outros
+              #   nomes (ex.: acesso via IP interno para debug), sem rejeitar
+              #   a requisição. Em produção 100% fechada, pode ser "true".
+
+            - name: KC_HTTP_ENABLED
+              value: "true"
+              # ↑ Habilita o listener HTTP puro (porta 8080) DENTRO do
+              #   cluster. É seguro pois o tráfego HTTP não sai da rede
+              #   interna do K3s — quem fala HTTPS com o mundo externo é o
+              #   Traefik (Ingress), que faz TLS termination.
+
+            - name: KC_PROXY_HEADERS
+              value: "xforwarded"
+              # ↑ Este é o parâmetro pedido para integração com o Traefik do
+              #   K3s. NOTA TÉCNICA: nas versões atuais do Keycloak/Quarkus, o
+              #   valor aceito é exatamente "xforwarded" (sem hífen) — ele
+              #   instrui o Keycloak a CONFIAR nos cabeçalhos
+              #   X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host
+              #   enviados pelo Traefik, reconstruindo corretamente o
+              #   protocolo (https) e IP de origem do usuário, mesmo estando
+              #   atrás de um proxy reverso.
+
+            # --- Health checks e observabilidade ---------------------------
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+              # ↑ Liga os endpoints /health/live, /health/ready e /health/started
+              #   na porta de management (9000), usados pelas probes abaixo.
+
+            - name: KC_METRICS_ENABLED
+              value: "true"
+              # ↑ Liga o endpoint /metrics (formato Prometheus) na porta de
+              #   management — útil para monitoramento futuro (Grafana/Prometheus),
+              #   sem custo relevante de performance.
+
+            # --- Clustering (cache distribuído entre as 2 réplicas) --------
+            - name: KC_CACHE
+              value: "ha"
+              # ↑ "ha" (high availability) ativa o modo de cache distribuído
+              #   do Infinispan, replicando sessões de login entre os Pods —
+              #   sem isso, cada réplica teria sua própria "memória" isolada
+              #   e o usuário seria deslogado ao alternar de Pod.
+
+            - name: KC_CACHE_STACK
+              value: "kubernetes"
+              # ↑ Usa o protocolo de descoberta KUBE_PING (via API do
+              #   Kubernetes, usando a permissão RBAC criada na seção 1) para
+              #   os Pods se encontrarem automaticamente — não exige
+              #   configuração manual de IPs.
+
+            - name: KC_CACHE_CONFIG_FILE
+              value: "cache-ha.xml"
+              # ↑ Arquivo de configuração de cache HA que já acompanha a
+              #   imagem oficial do Keycloak — não precisa ser criado por nós.
+
+          resources:
+            # ↑ Ajustado para caber confortavelmente em uma VM de 8GB
+            #   rodando 2 réplicas do Keycloak + Postgres + Vaultwarden.
+            requests:
+              cpu: "300m"
+              memory: "600Mi"
+              # ↑ RAM garantida por Pod. O Keycloak Quarkus roda bem com
+              #   ~512-700Mi em cargas de uma prefeitura de porte médio.
+            limits:
+              cpu: "1000m"
+              memory: "1024Mi"
+              # ↑ Teto de 1 vCPU e 1GiB de RAM por Pod — com 2 réplicas, o
+              #   consumo máximo teórico do Keycloak é 2GiB, deixando o
+              #   restante da VM livre para SO, Postgres e Vaultwarden.
+
+          # --- Probes de saúde (usam a porta de management: 9000) ----------
+          startupProbe:
+            # ↑ Protege contra o Keycloak ser morto por "demorar para subir"
+            #   na primeira inicialização (que é mais lenta, pois cria o
+            #   schema do banco). Enquanto esta probe não passar, as demais
+            #   (liveness/readiness) ficam PAUSADAS.
+            httpGet:
+              path: /health/started
+              port: 9000
+            failureThreshold: 30
+            # ↑ Permite até 30 tentativas falhas...
+            periodSeconds: 10
+            # ↑ ...verificando a cada 10s = até 5 minutos de tolerância para
+            #   o boot inicial completar antes de considerar falha real.
+
+          livenessProbe:
+            # ↑ "O processo travou/deadlock?" — se falhar repetidamente, o
+            #   Kubernetes MATA e RECRIA o container.
+            httpGet:
+              path: /health/live
+              port: 9000
+            initialDelaySeconds: 0
+            # ↑ Já pode começar a checar assim que o startupProbe passar
+            #   (elas não rodam em paralelo — a liveness só começa depois).
+            periodSeconds: 15
+            failureThreshold: 3
+            # ↑ 3 falhas seguidas (45s) antes de reiniciar o Pod.
+
+          readinessProbe:
+            # ↑ "Este Pod está pronto para RECEBER TRÁFEGO agora?" — se
+            #   falhar, o Service para de enviar requisições para este Pod
+            #   especificamente (sem matar o container), até ele se recuperar.
+            httpGet:
+              path: /health/ready
+              port: 9000
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            failureThreshold: 3
+
+      # (Sem tolerations/nodeSelector — cluster single-node não precisa.)
+
+---
+# ------------------------------------------------------------------------------
+# 3) Service — endereço de rede interno para o Keycloak
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  # ↑ Este nome é o que o ingress.yaml vai usar como `backend.service.name`.
+  namespace: authentication
+  labels:
+    app: keycloak
+
+spec:
+  type: ClusterIP
+  # ↑ Só acessível de dentro do cluster — quem expõe para a internet é o
+  #   Ingress/Traefik (ver ingress.yaml), nunca o Service diretamente.
+
+  selector:
+    app: keycloak
+    # ↑ Balanceia tráfego automaticamente entre as 2 réplicas do Deployment.
+
+  ports:
+    - name: http
+      port: 8080
+      # ↑ Porta exposta pelo Service para o resto do cluster (usada pelo Ingress).
+      targetPort: http
+      # ↑ Redireciona para a porta nomeada "http" (8080) dentro do container.
+      protocol: TCP

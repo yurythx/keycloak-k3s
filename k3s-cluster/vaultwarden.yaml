@@ -1,0 +1,206 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/vaultwarden.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Subir o Vaultwarden — implementação leve (em Rust) e compatível com a API
+#   do Bitwarden — para funcionar como o "cofre de senhas" corporativo da
+#   prefeitura. Extremamente econômico em RAM (essencial nos 8GB da VM).
+#
+# RECURSOS DECLARADOS NESTE ARQUIVO (em ordem lógica):
+#   1. PersistentVolumeClaim (PVC) -> disco dedicado onde ficam as chaves
+#      mestras e os cofres CRIPTOGRAFADOS dos usuários (dado mais sensível
+#      de toda a stack: se este disco for perdido sem backup, os cofres são
+#      IRRECUPERÁVEIS — a criptografia é ponta a ponta pelo cliente).
+#   2. Deployment (1 réplica) -> o container do Vaultwarden.
+#   3. Service (ClusterIP)    -> endereço de rede interno usado pelo Ingress.
+#
+# POR QUE 1 RÉPLICA APENAS?
+#   O Vaultwarden usa um banco SQLite embutido por padrão (arquivo local em
+#   disco), que não suporta múltiplos processos escrevendo ao mesmo tempo.
+#   Rodar 2 réplicas exigiria migrar para PostgreSQL/MySQL externo — possível
+#   no futuro, mas fora do escopo enxuto deste ambiente de 8GB.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1) PersistentVolumeClaim — disco dedicado para os cofres da prefeitura
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultwarden-pvc
+  namespace: authentication
+  labels:
+    app: vaultwarden
+
+spec:
+  accessModes:
+    - ReadWriteOnce
+    # ↑ Mesmo raciocínio do Postgres: só 1 Pod pode montar este disco em
+    #   leitura/escrita por vez — compatível com o SQLite embutido.
+
+  storageClassName: local-path
+  # ↑ Mesma StorageClass padrão do K3s usada no Postgres — grava direto no
+  #   disco local da VM, sem depender de storage externo.
+
+  resources:
+    requests:
+      storage: 5Gi
+      # ↑ 5 GiB é generoso para cofres de senha (dados de texto criptografado
+      #   são pequenos) — mesmo com centenas de usuários e anexos ocasionais.
+
+---
+# ------------------------------------------------------------------------------
+# 2) Deployment — o container do Vaultwarden
+# ------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden
+  namespace: authentication
+  labels:
+    app: vaultwarden
+
+spec:
+  replicas: 1
+  # ↑ Ver explicação no cabeçalho (SQLite não suporta múltiplos escritores).
+
+  selector:
+    matchLabels:
+      app: vaultwarden
+
+  strategy:
+    type: Recreate
+    # ↑ IMPORTANTE: diferente do Keycloak (RollingUpdate), aqui usamos
+    #   "Recreate" — o Kubernetes MATA o Pod antigo ANTES de subir o novo.
+    #   Isso é obrigatório porque o volume é ReadWriteOnce (só 1 Pod pode
+    #   montá-lo por vez); com RollingUpdate o novo Pod tentaria subir antes
+    #   do antigo liberar o disco e ficaria travado em "Pending" para sempre.
+
+  template:
+    metadata:
+      labels:
+        app: vaultwarden
+
+    spec:
+      containers:
+        - name: vaultwarden
+          image: vaultwarden/server:1.32.5-alpine
+          # ↑ Imagem oficial do Vaultwarden, variante "alpine" (mais leve).
+          #   ⚠️ Verifique periodicamente por versões mais novas em:
+          #   https://github.com/dani-garcia/vaultwarden/releases
+          #   e atualize esta tag conforme a política de patches de segurança
+          #   da prefeitura (recomenda-se checar mensalmente).
+
+          ports:
+            - name: http
+              containerPort: 80
+              # ↑ Porta HTTP interna padrão em que o Vaultwarden escuta.
+
+          env:
+            - name: DOMAIN
+              value: "https://cofres.prefeitura.gov.br"
+              # ↑ URL pública completa (com https://) pelo qual os usuários
+              #   acessam o cofre. Usado para gerar links corretos em
+              #   e-mails de convite/recuperação e para validar WebAuthn/Passkeys.
+
+            - name: SIGNUPS_ALLOWED
+              value: "false"
+              # ↑ ⚠️ CONFIGURAÇÃO DE SEGURANÇA CRÍTICA para um ambiente
+              #   governamental: DESATIVA o autocadastro público. Só o
+              #   administrador (via painel /admin) pode convidar/criar
+              #   novos usuários — evita que qualquer pessoa na internet
+              #   crie uma conta no cofre da prefeitura.
+
+            - name: SIGNUPS_VERIFY
+              value: "true"
+              # ↑ Caso algum convite de cadastro seja enviado, exige
+              #   verificação de e-mail antes de liberar o acesso ao cofre.
+
+            - name: WEBSOCKET_ENABLED
+              value: "true"
+              # ↑ Habilita sincronização em TEMPO REAL entre dispositivos
+              #   (ex.: ao trocar uma senha no celular, o cofre no PC
+              #   atualiza na hora, sem precisar dar F5/sincronizar manual).
+
+            - name: LOG_LEVEL
+              value: "warn"
+              # ↑ Reduz o volume de logs para apenas avisos/erros — em
+              #   produção evita poluir os logs e consumir I/O desnecessário.
+
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: VAULTWARDEN_ADMIN_TOKEN
+              # ↑ Protege a rota /admin (painel administrativo web). Sem
+              #   este token configurado, o Vaultwarden desativa o painel
+              #   /admin por padrão (comportamento "seguro por padrão").
+
+          volumeMounts:
+            - name: vaultwarden-storage
+              mountPath: /data
+              # ↑ Caminho onde o Vaultwarden grava o banco SQLite, as chaves
+              #   RSA do servidor e os anexos dos usuários — TUDO que precisa
+              #   ser persistido vive dentro desta pasta.
+
+          resources:
+            # ↑ O Vaultwarden é extremamente leve (escrito em Rust) — mesmo
+            #   com dezenas de usuários simultâneos, raramente passa de
+            #   50-80Mi de RAM em uso real.
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+
+          readinessProbe:
+            # ↑ O Vaultwarden expõe um endpoint público simples de saúde.
+            httpGet:
+              path: /alive
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /alive
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+      volumes:
+        - name: vaultwarden-storage
+          persistentVolumeClaim:
+            claimName: vaultwarden-pvc
+            # ↑ Conecta este Pod ao PVC dedicado criado no início deste
+            #   arquivo — garante que as chaves da prefeitura fiquem
+            #   fisicamente salvas no disco da VM, sobrevivendo a reinícios.
+
+---
+# ------------------------------------------------------------------------------
+# 3) Service — endereço de rede interno para o Vaultwarden
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden
+  # ↑ Nome usado pelo ingress.yaml como `backend.service.name`.
+  namespace: authentication
+  labels:
+    app: vaultwarden
+
+spec:
+  type: ClusterIP
+  # ↑ Exposição apenas interna — o acesso externo passa pelo Ingress/Traefik.
+
+  selector:
+    app: vaultwarden
+
+  ports:
+    - name: http
+      port: 80
+      # ↑ Porta exposta pelo Service (usada pelo Ingress).
+      targetPort: http
+      # ↑ Redireciona para a porta nomeada "http" (80) dentro do container.
+      protocol: TCP

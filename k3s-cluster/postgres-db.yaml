@@ -1,0 +1,246 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/postgres-db.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Provisionar o banco de dados relacional PostgreSQL 16 (imagem "alpine",
+#   mais leve — importante pois a VM tem só 8GB de RAM) que serve de backend
+#   de persistência para o Keycloak (realms, usuários, sessões, etc.).
+#
+# RECURSOS DECLARADOS NESTE ARQUIVO (3 objetos, em ordem lógica):
+#   1. PersistentVolumeClaim (PVC) -> reserva 10Gi em disco na VM.
+#   2. Deployment                  -> roda o container do Postgres (1 réplica).
+#   3. Service (ClusterIP)         -> endereço de rede estável "postgres" para
+#                                      o Keycloak conseguir se conectar.
+#
+# POR QUE 1 RÉPLICA APENAS?
+#   PostgreSQL não é "stateless": rodar 2 réplicas escrevendo no mesmo PVC
+#   corrompe os dados. Alta disponibilidade de banco exigiria replicação
+#   nativa (Patroni, Postgres Operator) — fora do escopo de uma VM de 8GB.
+#   Aqui, a resiliência vem do PVC em disco: se o Pod cair, o K3s recria o
+#   Pod e ele MONTA O MESMO DISCO, sem perda de dados.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1) PersistentVolumeClaim — o "pedido de disco" para os dados do Postgres
+# ------------------------------------------------------------------------------
+apiVersion: v1
+# ↑ PVC também é um objeto "core" da API v1 do Kubernetes.
+
+kind: PersistentVolumeClaim
+# ↑ Um PVC é um "pedido" de armazenamento persistente. O Kubernetes (via o
+#   provisionador padrão do K3s, chamado "local-path-provisioner") atende
+#   esse pedido criando um PersistentVolume (PV) real em disco na VM.
+
+metadata:
+  name: postgres-pvc
+  # ↑ Nome do PVC. O Deployment do Postgres (abaixo) referencia este nome em
+  #   `volumes[].persistentVolumeClaim.claimName`.
+  namespace: authentication
+  # ↑ Mesmo namespace de todos os outros recursos desta stack.
+  labels:
+    app: postgres
+    # ↑ Rótulo simples usado para identificar visualmente a quem este disco pertence.
+
+spec:
+  accessModes:
+    - ReadWriteOnce
+    # ↑ "ReadWriteOnce" (RWO) significa que o volume só pode ser montado por
+    #   UM único Pod (em modo leitura/escrita) por vez. É o modo correto para
+    #   bancos de dados tradicionais como o Postgres, que não suportam
+    #   múltiplos escritores simultâneos no mesmo arquivo de dados.
+
+  storageClassName: local-path
+  # ↑ "local-path" é a StorageClass PADRÃO que já vem instalada de fábrica no
+  #   K3s (via o componente "Local Path Provisioner" da Rancher). Ela cria o
+  #   volume como uma pasta real dentro do disco local da própria VM (em
+  #   /var/lib/rancher/k3s/storage/ por padrão). Ideal para um cluster
+  #   single-node como o nosso — não exige NFS, Ceph nem storage externo.
+
+  resources:
+    requests:
+      storage: 10Gi
+      # ↑ Tamanho do disco reservado para os dados do Postgres: 10 GiB.
+      #   Suficiente para anos de dados de autenticação de uma prefeitura
+      #   (o Keycloak grava principalmente metadados, não arquivos grandes).
+      #   Pode ser aumentado depois editando este valor (o local-path
+      #   provisioner do K3s suporta expansão de volume).
+
+---
+# ------------------------------------------------------------------------------
+# 2) Deployment — o "molde" que roda o container do PostgreSQL
+# ------------------------------------------------------------------------------
+apiVersion: apps/v1
+# ↑ Deployments vivem no grupo de API "apps", versão "v1" (estável).
+
+kind: Deployment
+# ↑ Um Deployment gerencia um ou mais Pods idênticos, garantindo que a
+#   quantidade de réplicas desejada esteja sempre no ar (recriando Pods que
+#   morrerem, fazendo rolling updates, etc.).
+
+metadata:
+  name: postgres
+  namespace: authentication
+  labels:
+    app: postgres
+    # ↑ Este rótulo é o que conecta o Deployment ao Service (via selector,
+    #   mais abaixo) — o Service "acha" os Pods procurando por `app: postgres`.
+
+spec:
+  replicas: 1
+  # ↑ Apenas 1 Pod do Postgres no ar (ver explicação de HA no cabeçalho acima).
+
+  selector:
+    matchLabels:
+      app: postgres
+      # ↑ Diz ao Deployment: "gerencie todos os Pods que tiverem o rótulo
+      #   app=postgres". Esse valor TEM que ser idêntico ao label em
+      #   template.metadata.labels logo abaixo — é uma exigência da API do K8s.
+
+  template:
+    # ↑ O "template" é o molde usado para criar cada Pod (réplica).
+    metadata:
+      labels:
+        app: postgres
+        # ↑ Rótulo aplicado a cada Pod criado — usado pelo selector acima
+        #   e pelo Service para rotear tráfego até aqui.
+
+    spec:
+      containers:
+        - name: postgres
+          # ↑ Nome do container dentro do Pod (aparece em `kubectl logs -c postgres`).
+
+          image: postgres:16-alpine
+          # ↑ Imagem oficial do PostgreSQL, versão 16, variante "alpine"
+          #   (baseada em Alpine Linux — imagem muito menor e mais leve em
+          #   RAM/disco que a variante "debian" padrão). Escolha essencial
+          #   para uma VM com apenas 8GB de RAM total.
+
+          ports:
+            - containerPort: 5432
+              # ↑ Porta padrão em que o PostgreSQL escuta conexões TCP.
+              name: postgres
+              # ↑ Nome da porta — permite que o Service a referencie pelo
+              #   nome em vez de precisar repetir o número.
+
+          envFrom:
+            - secretRef:
+                name: auth-stack-credentials
+                # ↑ Importa TODAS as chaves do Secret "auth-stack-credentials"
+                #   como variáveis de ambiente automaticamente. A imagem
+                #   oficial do Postgres já sabe ler POSTGRES_DB, POSTGRES_USER
+                #   e POSTGRES_PASSWORD para se autoconfigurar no primeiro boot.
+                #   (Isso também injeta as variáveis do Keycloak/Vaultwarden
+                #   dentro deste container, mas elas simplesmente ficam sem uso
+                #   — não representa risco funcional, apenas "ruído".)
+
+          volumeMounts:
+            - name: postgres-storage
+              # ↑ Precisa bater com o nome definido em `volumes` logo abaixo.
+              mountPath: /var/lib/postgresql/data
+              # ↑ Caminho DENTRO do container onde o Postgres grava seus
+              #   arquivos de dados. Ao montar o PVC aqui, os dados
+              #   sobrevivem a reinícios e recriações do Pod.
+              subPath: postgres
+              # ↑ Cria uma subpasta "postgres" dentro do volume, em vez de
+              #   usar a raiz do PVC diretamente. Boa prática: evita conflito
+              #   com o arquivo oculto "lost+found" que alguns provisionadores
+              #   de storage criam automaticamente na raiz do volume.
+
+          resources:
+            # ↑ Define quanto de CPU/RAM o container PODE usar (limits) e
+            #   quanto está GARANTIDO para ele (requests). Fundamental numa
+            #   VM de 8GB para evitar que um serviço "sufoque" os outros.
+            requests:
+              cpu: "100m"
+              # ↑ 100 milicores = 0.1 vCPU garantido para o Postgres iniciar.
+              memory: "256Mi"
+              # ↑ 256 MiB de RAM garantidos (reservados) para este Pod.
+            limits:
+              cpu: "500m"
+              # ↑ Nunca pode consumir mais que meio núcleo de CPU — evita que
+              #   um pico de uso do banco atrapalhe o Keycloak.
+              memory: "512Mi"
+              # ↑ Teto máximo de RAM. Se ultrapassar, o Kubernetes mata o
+              #   container (OOMKilled) e o Deployment sobe outro no lugar.
+
+          readinessProbe:
+            # ↑ Pergunta "este Pod já está PRONTO para receber tráfego?".
+            #   Enquanto a resposta for "não", o Service não envia requisições
+            #   para ele (evita erros de conexão durante o boot do banco).
+            exec:
+              command: ["pg_isready", "-U", "keycloak_admin", "-d", "keycloak"]
+              # ↑ `pg_isready` é um utilitário oficial do Postgres que
+              #   verifica se o servidor está aceitando conexões — muito mais
+              #   confiável do que apenas checar se a porta 5432 está aberta.
+            initialDelaySeconds: 10
+            # ↑ Espera 10s após o container subir antes da PRIMEIRA checagem
+            #   (dá tempo do Postgres inicializar o banco na primeira vez).
+            periodSeconds: 10
+            # ↑ Repete a checagem a cada 10 segundos.
+
+          livenessProbe:
+            # ↑ Pergunta "este Pod ainda está VIVO e funcional?". Se falhar
+            #   repetidamente, o Kubernetes MATA e RECRIA o container
+            #   (autocura de travamentos internos).
+            exec:
+              command: ["pg_isready", "-U", "keycloak_admin", "-d", "keycloak"]
+            initialDelaySeconds: 30
+            # ↑ Prazo maior que o readiness, para não matar o container à toa
+            #   enquanto ele ainda está subindo pela primeira vez.
+            periodSeconds: 20
+
+      # (Sem "securityContext" avançado aqui por simplicidade didática — em
+      # produção, considere rodar como usuário não-root e com
+      # `readOnlyRootFilesystem` onde a imagem permitir.)
+
+      volumes:
+        - name: postgres-storage
+          # ↑ Precisa bater com o nome usado em `volumeMounts` acima.
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+            # ↑ Conecta este Pod ao disco persistente criado no início deste
+            #   arquivo — é isso que garante que os dados sobrevivam a
+            #   reinícios do Pod.
+
+---
+# ------------------------------------------------------------------------------
+# 3) Service — o "endereço de rede fixo" para o banco, dentro do cluster
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+# ↑ Um Service cria um nome DNS estável e um IP virtual interno que
+#   redireciona tráfego para os Pods que casarem com o `selector` abaixo —
+#   mesmo que o Pod seja recriado (e ganhe um IP novo), o Service continua
+#   funcionando com o mesmo nome.
+
+metadata:
+  name: postgres
+  # ↑ Este nome vira automaticamente um domínio DNS interno do cluster:
+  #   "postgres.authentication.svc.cluster.local" (ou simplesmente
+  #   "postgres" para Pods dentro do mesmo namespace) — é o valor que o
+  #   Keycloak vai usar como KC_DB_URL_HOST.
+  namespace: authentication
+  labels:
+    app: postgres
+
+spec:
+  type: ClusterIP
+  # ↑ "ClusterIP" é o tipo PADRÃO de Service: expõe o Postgres apenas
+  #   DENTRO do cluster (nenhum acesso vindo de fora da VM). Correto para um
+  #   banco de dados, que jamais deve ser exposto publicamente.
+
+  selector:
+    app: postgres
+    # ↑ Roteia tráfego para qualquer Pod com o rótulo `app: postgres` —
+    #   neste caso, os Pods criados pelo Deployment acima.
+
+  ports:
+    - port: 5432
+      # ↑ Porta que o Service expõe PARA OS OUTROS Pods do cluster
+      #   (é a porta que o Keycloak vai usar para se conectar: postgres:5432).
+      targetPort: postgres
+      # ↑ Porta real DENTRO do container para onde o tráfego é redirecionado.
+      #   Usamos o NOME "postgres" definido em containerPort.name acima, em
+      #   vez do número — mais legível e resistente a mudanças futuras.
+      protocol: TCP
+      # ↑ PostgreSQL fala exclusivamente TCP (não há suporte a UDP aqui).

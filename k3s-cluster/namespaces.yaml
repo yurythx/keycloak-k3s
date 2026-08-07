@@ -1,0 +1,58 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/namespaces.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Criar o Namespace "authentication", o "compartimento" lógico dentro do
+#   cluster K3s onde TODOS os recursos desta stack (PostgreSQL, Keycloak,
+#   Vaultwarden, Secrets, RBAC, Ingress) vão residir.
+#
+# POR QUE USAR UM NAMESPACE DEDICADO?
+#   1. ISOLAMENTO: evita colisão de nomes com outras aplicações do cluster
+#      (ex.: se amanhã a prefeitura subir um Grafana, ele não vai brigar de
+#      nome com nada aqui dentro).
+#   2. SEGURANÇA (RBAC): permitimos que a ServiceAccount do Keycloak (usada
+#      para descoberta de cluster via KUBE_PING) só tenha permissão de listar
+#      Pods DENTRO deste namespace, e não no cluster inteiro.
+#   3. ORGANIZAÇÃO E LIMPEZA: comandos como `kubectl get all -n authentication`
+#      mostram só o que interessa, e `kubectl delete namespace authentication`
+#      remove a stack inteira de uma vez, sem deixar resíduos.
+#
+# ORDEM DE APLICAÇÃO
+#   Este é sempre o PRIMEIRO manifesto a ser aplicado pela pipeline de deploy,
+#   pois todos os outros arquivos referenciam `namespace: authentication`.
+# ==============================================================================
+
+apiVersion: v1
+# ↑ Versão da API do Kubernetes usada para objetos "core" (nativos), como
+#   Namespace, Pod, Service, Secret, PersistentVolumeClaim, etc.
+#   "v1" é a versão estável (GA) — não muda entre versões do Kubernetes.
+
+kind: Namespace
+# ↑ Diz ao Kubernetes qual TIPO de recurso este manifesto descreve.
+#   Aqui estamos declarando um Namespace (um agrupador lógico de recursos).
+
+metadata:
+  # ↑ Bloco de metadados: informações que IDENTIFICAM o objeto (mas não o
+  #   configuram funcionalmente — isso fica em "spec", que o Namespace nem
+  #   precisa ter, pois é um objeto simples).
+
+  name: authentication
+  # ↑ Nome único do Namespace dentro do cluster inteiro (namespaces não podem
+  #   ser aninhados nem repetidos). Todos os outros manifestos desta stack
+  #   vão usar `namespace: authentication` para "morar" aqui dentro.
+
+  labels:
+    # ↑ Rótulos (labels) são pares chave/valor livres, usados para organizar,
+    #   filtrar e selecionar recursos (ex.: `kubectl get ns -l app.kubernetes.io/part-of=prefeitura-auth-stack`).
+    #   Não afetam o funcionamento do cluster, só a organização/observabilidade.
+
+    app.kubernetes.io/part-of: prefeitura-auth-stack
+    # ↑ Rótulo padrão (convenção oficial do Kubernetes) que indica que este
+    #   Namespace faz parte de uma aplicação maior chamada "prefeitura-auth-stack".
+    #   Útil para dashboards (ex.: Rancher, Lens, Grafana) agruparem tudo junto.
+
+    app.kubernetes.io/managed-by: github-actions
+    # ↑ Documenta que o CICLO DE VIDA deste recurso é controlado via pipeline
+    #   GitOps (GitHub Actions), e não editado manualmente com `kubectl edit`.
+    #   Isso é uma prática de mercado: qualquer alteração deve entrar via Git,
+    #   nunca diretamente no cluster (evita "configuration drift").
