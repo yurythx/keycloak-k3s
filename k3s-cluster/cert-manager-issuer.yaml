@@ -1,0 +1,106 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/cert-manager-issuer.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Configurar o cert-manager para emitir e renovar AUTOMATICAMENTE
+#   certificados HTTPS válidos (Let's Encrypt) para os domínios
+#   sso.rondonopolis.mt.gov.br e cofre.rondonopolis.mt.gov.br, eliminando o
+#   alerta de "certificado não confiável" que apareceria com o certificado
+#   autoassinado padrão do Traefik.
+#
+# ⚠️ PRÉ-REQUISITO OBRIGATÓRIO — LEIA ANTES DE APLICAR
+#   Este arquivo usa os tipos `ClusterIssuer` e `Certificate`, que só
+#   existem no cluster DEPOIS que o cert-manager for instalado (ele
+#   registra esses tipos via CRDs — Custom Resource Definitions). O
+#   cert-manager é uma peça de INFRAESTRUTURA DO CLUSTER (como o próprio
+#   K3s ou o Traefik), então ele é instalado UMA ÚNICA VEZ, manualmente,
+#   fora do fluxo de GitOps desta aplicação — veja o passo a passo completo
+#   na seção "Bootstrap único do cluster" do README.md.
+#
+#   Se você aplicar este arquivo ANTES de instalar o cert-manager, o
+#   `kubectl apply` vai falhar com um erro do tipo
+#   "no matches for kind ClusterIssuer" — isso é esperado e inofensivo; a
+#   pipeline (deploy.yml) já trata esse caso sem quebrar o deploy do resto
+#   da stack (ver comentário no step correspondente de deploy.yml).
+#
+# COMO FUNCIONA O DESAFIO HTTP-01
+#   O Let's Encrypt precisa provar que você realmente é dono dos domínios
+#   antes de emitir o certificado. O cert-manager faz isso automaticamente
+#   criando um Pod/Ingress temporário que responde a uma URL específica
+#   (ex.: http://sso.rondonopolis.mt.gov.br/.well-known/acme-challenge/...)
+#   — por isso os registros DNS dos domínios PRECISAM já estar apontando
+#   para o IP público da VM, e a porta 80 PRECISA estar acessível da
+#   internet, antes deste processo funcionar.
+# ==============================================================================
+
+apiVersion: cert-manager.io/v1
+# ↑ Grupo de API criado pelo cert-manager após sua instalação no cluster.
+
+kind: ClusterIssuer
+# ↑ "ClusterIssuer" (diferente de "Issuer") é um emissor de certificados
+#   disponível para TODOS os namespaces do cluster — adequado aqui, pois
+#   embora hoje só usemos o namespace "authentication", um ClusterIssuer
+#   evita ter que recriar a configuração se outra aplicação precisar de
+#   certificado no futuro.
+
+metadata:
+  name: letsencrypt-prod
+  # ↑ Nome referenciado pela annotation `cert-manager.io/cluster-issuer`
+  #   em `ingress.yaml` — precisa ser IDÊNTICO nos dois arquivos.
+
+spec:
+  acme:
+    # ↑ ACME é o protocolo usado pelo Let's Encrypt (e outras autoridades
+    #   certificadoras gratuitas/automatizadas) para emitir certificados.
+
+    server: https://acme-v02.api.letsencrypt.org/directory
+    # ↑ Endpoint de PRODUÇÃO do Let's Encrypt. Emite certificados
+    #   REALMENTE confiáveis pelos navegadores, mas tem limite de taxa
+    #   (rate limit) — poucas tentativas por semana por domínio. Por isso,
+    #   ao testar pela primeira vez, é recomendável usar o endpoint de
+    #   STAGING (veja o bloco comentado abaixo) para não "gastar" suas
+    #   tentativas de produção enquanto ainda está validando a configuração.
+
+    # server: https://acme-staging-v02.api.letsencrypt.org/directory
+    # ↑ (Alternativa para TESTES) Endpoint de staging: emite certificados
+    #   que os navegadores NÃO confiam (mostra alerta), mas sem limite de
+    #   taxa agressivo — use este primeiro se quiser validar que todo o
+    #   fluxo (DNS + desafio HTTP-01 + emissão) está funcionando, antes de
+    #   trocar para o endpoint de produção acima e reaplicar este arquivo.
+
+    email: "ti@rondonopolis.mt.gov.br"
+    # ↑ ⚠️ TROQUE para o e-mail real da equipe de TI da prefeitura
+    #   responsável por este cluster. O Let's Encrypt usa este endereço
+    #   APENAS para avisos administrativos (ex.: certificado prestes a
+    #   expirar por falha na renovação automática) — não é usado no
+    #   certificado em si nem é público.
+
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+      # ↑ Nome do Secret onde o cert-manager guarda a CHAVE DA CONTA ACME
+      #   (não é o certificado do site — é a credencial que identifica
+      #   "esta instalação do cert-manager" perante o Let's Encrypt).
+      #   Criado e gerenciado automaticamente; você não precisa mexer nele.
+
+    solvers:
+      # ↑ Lista de "métodos de prova de propriedade do domínio". Usamos
+      #   apenas um: HTTP-01, resolvido automaticamente através do Traefik.
+      - http01:
+          ingress:
+            ingressClassName: traefik
+            # ↑ Diz ao cert-manager para resolver o desafio HTTP-01
+            #   criando temporariamente uma regra de Ingress usando a MESMA
+            #   IngressClass ("traefik") já usada pelo restante da stack —
+            #   garante que o desafio passe pelo mesmo Traefik que já está
+            #   recebendo tráfego nas portas 80/443 da VM.
+
+# ==============================================================================
+# COMO VALIDAR SE FUNCIONOU (depois de instalado + DNS configurado):
+#   kubectl get clusterissuer letsencrypt-prod
+#     -> READY deve estar "True"
+#   kubectl get certificate -n authentication
+#     -> auth-stack-tls-cert deve estar READY "True" após alguns minutos
+#   kubectl describe certificate auth-stack-tls-cert -n authentication
+#     -> mostra o histórico de eventos caso a emissão esteja demorando ou
+#        falhando (ex.: DNS ainda não propagado, porta 80 bloqueada, etc.)
+# ==============================================================================

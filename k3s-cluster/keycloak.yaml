@@ -236,11 +236,13 @@ spec:
 
             # --- Hostname público e proxy reverso (Traefik) ----------------
             - name: KC_HOSTNAME
-              value: "login.prefeitura.gov.br"
-              # ↑ Domínio público pelo qual os usuários acessam o Keycloak.
-              #   Usado para gerar corretamente os links internos (login,
-              #   redirect URIs, emails) — se estiver errado, o Keycloak gera
-              #   URLs quebradas mesmo funcionando "por dentro".
+              value: "sso.rondonopolis.mt.gov.br"
+              # ↑ Domínio público pelo qual os usuários acessam o Keycloak
+              #   (SSO da Prefeitura de Rondonópolis-MT). Usado para gerar
+              #   corretamente os links internos (login, redirect URIs,
+              #   e-mails) — se estiver errado, o Keycloak gera URLs
+              #   quebradas mesmo funcionando "por dentro". Precisa bater
+              #   EXATAMENTE com o host declarado em `ingress.yaml`.
 
             - name: KC_HOSTNAME_STRICT
               value: "false"

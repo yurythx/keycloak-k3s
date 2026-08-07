@@ -98,10 +98,13 @@ spec:
 
           env:
             - name: DOMAIN
-              value: "https://cofres.prefeitura.gov.br"
+              value: "https://cofre.rondonopolis.mt.gov.br"
               # ↑ URL pública completa (com https://) pelo qual os usuários
-              #   acessam o cofre. Usado para gerar links corretos em
-              #   e-mails de convite/recuperação e para validar WebAuthn/Passkeys.
+              #   acessam o cofre da Prefeitura de Rondonópolis-MT. Usado
+              #   para gerar links corretos em e-mails de convite/recuperação
+              #   e para validar WebAuthn/Passkeys. Precisa bater EXATAMENTE
+              #   com o host declarado em `ingress.yaml` (incluindo o
+              #   `https://` no início).
 
             - name: SIGNUPS_ALLOWED
               value: "false"

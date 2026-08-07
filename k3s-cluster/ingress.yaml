@@ -7,8 +7,8 @@
 #   INSTALADO POR PADRÃO em qualquer cluster K3s (não precisa instalar Nginx
 #   Ingress nem nada extra).
 #
-#   login.prefeitura.gov.br   -> Service "keycloak"   (porta 8080)
-#   cofres.prefeitura.gov.br  -> Service "vaultwarden" (porta 80)
+#   sso.rondonopolis.mt.gov.br   -> Service "keycloak"   (porta 8080)
+#   cofre.rondonopolis.mt.gov.br -> Service "vaultwarden" (porta 80)
 #
 # COMO FUNCIONA O ROTEAMENTO
 #   O Traefik recebe TODO o tráfego HTTP/HTTPS que chega na VM (ele já
@@ -17,14 +17,17 @@
 #   encaminhar — é assim que conseguimos hospedar 2 aplicações diferentes
 #   usando o mesmo IP público e as mesmas portas 80/443.
 #
-# ⚠️ SOBRE TLS/HTTPS
-#   Este manifesto define a ESTRUTURA de roteamento. Para HTTPS válido
-#   (certificado confiável, sem alerta no navegador), o próximo passo
-#   recomendado é instalar o cert-manager + emissor Let's Encrypt no
-#   cluster — deixamos o bloco `tls:` já comentado e pronto para ativar.
-#   Enquanto isso não for feito, o Traefik ainda responde em HTTPS com um
-#   certificado autoassinado padrão (gera alerta de segurança no navegador,
-#   mas o tráfego já é criptografado).
+# ⚠️ SOBRE TLS/HTTPS (cert-manager já habilitado neste arquivo)
+#   Este Ingress já está configurado para pedir automaticamente um
+#   certificado HTTPS válido (Let's Encrypt) via cert-manager, através da
+#   annotation `cert-manager.io/cluster-issuer` e do bloco `tls:` abaixo.
+#   ISSO SÓ FUNCIONA DEPOIS que você instalar o cert-manager e aplicar o
+#   ClusterIssuer definido em `k3s-cluster/cert-manager-issuer.yaml` — veja
+#   o passo a passo de bootstrap único no README.md, seção "Bootstrap único
+#   do cluster". Até lá, o Traefik responde em HTTPS com um certificado
+#   autoassinado (gera alerta no navegador, mas o tráfego já é criptografado)
+#   e o cert-manager, assim que instalado, substitui automaticamente esse
+#   certificado pelo válido — sem precisar editar este arquivo de novo.
 # ==============================================================================
 
 apiVersion: networking.k8s.io/v1
@@ -40,24 +43,27 @@ metadata:
 
   annotations:
     # ↑ Annotations são metadados EXTRAS lidos pelo Ingress Controller
-    #   (Traefik) para comportamentos específicos que a spec genérica do
-    #   Kubernetes não cobre.
+    #   (Traefik) e pelo cert-manager para comportamentos específicos que a
+    #   spec genérica do Kubernetes não cobre.
 
     traefik.ingress.kubernetes.io/router.entrypoints: websecure,web
     # ↑ Diz ao Traefik para escutar este Ingress tanto na entrypoint
     #   "web" (porta 80/HTTP) quanto "websecure" (porta 443/HTTPS) — os
     #   dois entrypoints já vêm criados por padrão na instalação do K3s.
+    #   A entrypoint "web" (80) continua ativa porque o desafio HTTP-01 do
+    #   Let's Encrypt (usado pelo cert-manager para provar que você é dono
+    #   do domínio) é respondido em texto plano, na porta 80.
 
     traefik.ingress.kubernetes.io/router.tls: "true"
-    # ↑ Ativa TLS (HTTPS) para este roteador — sem certificado próprio
-    #   configurado, o Traefik usa o certificado autoassinado padrão dele.
+    # ↑ Ativa TLS (HTTPS) para este roteador.
 
-  # ↑ (Opcional, comentado) Se você instalar o cert-manager mais adiante,
-  #   descomente a linha abaixo apontando para o ClusterIssuer do
-  #   Let's Encrypt — ele passa a emitir/renovar certificados válidos
-  #   automaticamente para os hosts declarados neste Ingress:
-  #
-  #   cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # ↑ Diz ao cert-manager (depois de instalado — ver README) "monitore
+    #   este Ingress e emita/renove automaticamente um certificado Let's
+    #   Encrypt válido para os hosts declarados nele, usando o emissor
+    #   ClusterIssuer chamado 'letsencrypt-prod'" (definido em
+    #   cert-manager-issuer.yaml). A renovação (a cada ~60 dias) também é
+    #   automática — nenhuma ação manual necessária depois de configurado.
 
 spec:
   ingressClassName: traefik
@@ -65,28 +71,28 @@ spec:
   #   'traefik' para processar este recurso" — é o nome padrão da
   #   IngressClass já registrada de fábrica pelo K3s.
 
-  # ----------------------------------------------------------------------
-  # tls:
-  # ↑ (Bloco comentado — ative após instalar o cert-manager) Quando ativo,
-  #   instrui o Traefik/cert-manager a guardar o certificado emitido dentro
-  #   de um Secret do tipo `kubernetes.io/tls` com o nome indicado, e a
-  #   usá-lo para servir HTTPS nestes hosts específicos.
-  #
-  # tls:
-  #   - hosts:
-  #       - login.prefeitura.gov.br
-  #       - cofres.prefeitura.gov.br
-  #     secretName: auth-stack-tls-cert
-  # ----------------------------------------------------------------------
+  tls:
+    # ↑ Ativo desde já: instrui o Traefik a servir HTTPS para os hosts
+    #   abaixo usando o certificado guardado no Secret indicado em
+    #   `secretName`. Esse Secret é criado e mantido AUTOMATICAMENTE pelo
+    #   cert-manager assim que ele estiver instalado e o ClusterIssuer
+    #   aplicado — você não precisa criá-lo manualmente.
+    - hosts:
+        - sso.rondonopolis.mt.gov.br
+        - cofre.rondonopolis.mt.gov.br
+      secretName: auth-stack-tls-cert
+      # ↑ Nome do Secret (tipo `kubernetes.io/tls`) onde o cert-manager vai
+      #   armazenar o certificado + chave privada emitidos pelo Let's
+      #   Encrypt, cobrindo os dois domínios acima.
 
   rules:
     # ↑ Lista de regras de roteamento — cada item associa um domínio
     #   (host) a um Service de destino.
 
-    - host: login.prefeitura.gov.br
-      # ↑ Domínio público do Keycloak. Precisa ter um registro DNS tipo A
-      #   apontando para o IP público da VM (configurado FORA deste
-      #   repositório, no provedor de DNS da prefeitura).
+    - host: sso.rondonopolis.mt.gov.br
+      # ↑ Domínio público do Keycloak (SSO da prefeitura de Rondonópolis).
+      #   Precisa ter um registro DNS tipo A apontando para o IP público
+      #   da VM (configurado FORA deste repositório, no provedor de DNS).
 
       http:
         paths:
@@ -106,7 +112,7 @@ spec:
                   #   diretamente) — precisa bater com `spec.ports[].port`
                   #   do Service "keycloak".
 
-    - host: cofres.prefeitura.gov.br
+    - host: cofre.rondonopolis.mt.gov.br
       # ↑ Domínio público do Vaultwarden — também precisa de registro DNS
       #   tipo A próprio, apontando para o mesmo IP público da VM.
 
@@ -123,14 +129,14 @@ spec:
                   # ↑ Porta exposta pelo Service "vaultwarden".
 
 # ==============================================================================
-# PRÓXIMOS PASSOS RECOMENDADOS (fora do escopo deste arquivo, mas importantes):
-#   1. Configurar 2 registros DNS tipo A na zona "prefeitura.gov.br":
-#        login.prefeitura.gov.br   -> IP público da VM
-#        cofres.prefeitura.gov.br  -> IP público da VM
+# PRÓXIMOS PASSOS RECOMENDADOS (fora do escopo deste arquivo — ver README.md):
+#   1. Configurar 2 registros DNS tipo A na zona "rondonopolis.mt.gov.br":
+#        sso.rondonopolis.mt.gov.br    -> IP público da VM
+#        cofre.rondonopolis.mt.gov.br  -> IP público da VM
+#      (Precisam estar resolvendo corretamente ANTES do cert-manager tentar
+#      emitir o certificado, pois o desafio HTTP-01 valida via DNS+HTTP real.)
 #   2. Abrir/mapear apenas as portas 80 e 443 no firewall/roteador da VM
 #      (NUNCA a porta do SSH/Kubernetes API para a internet).
-#   3. Instalar o cert-manager para certificados HTTPS válidos automáticos:
-#        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-#      e então criar um ClusterIssuer do Let's Encrypt, descomentando o
-#      bloco `tls:` acima.
+#   3. Instalar o cert-manager e aplicar o ClusterIssuer — passo a passo
+#      completo na seção "Bootstrap único do cluster" do README.md.
 # ==============================================================================

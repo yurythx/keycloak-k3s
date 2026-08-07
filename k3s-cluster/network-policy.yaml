@@ -1,0 +1,99 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/network-policy.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Aplicar segmentação de rede DENTRO do cluster (defesa em profundidade):
+#   o banco de dados PostgreSQL só pode ser acessado pelos Pods do
+#   Keycloak — nenhum outro Pod do namespace (nem o Vaultwarden, nem
+#   qualquer workload futuro) consegue abrir conexão na porta 5432.
+#
+#   Isso limita o "raio de explosão" (blast radius) caso um outro
+#   componente da stack seja comprometido: mesmo que um invasor consiga
+#   executar comandos dentro do Pod do Vaultwarden, por exemplo, a rede do
+#   cluster já impede que ele alcance o banco de dados de credenciais do
+#   Keycloak diretamente.
+#
+# ⚠️ PRÉ-REQUISITO IMPORTANTE — LEIA ANTES DE DEPENDER DESTE ARQUIVO
+#   Uma NetworkPolicy só é EFETIVAMENTE aplicada (bloqueando tráfego de
+#   verdade) se o plugin de rede (CNI) do cluster souber interpretá-la. O
+#   K3s, por padrão, usa o Flannel como CNI — e o Flannel puro **NÃO
+#   ENFORCA NetworkPolicies** (ele apenas ignora este recurso, sem dar erro
+#   nenhum). Ou seja: aplicar este arquivo em um K3s "de fábrica" é 100%
+#   seguro e não quebra nada, mas a restrição descrita aqui só passa a ser
+#   REALMENTE aplicada se o cluster tiver um controlador de NetworkPolicy
+#   ativo (ex.: Calico, Cilium, ou kube-router rodando ao lado do Flannel).
+#
+#   Deixamos esta política já declarada (boa prática de "documentar a
+#   intenção de segurança como código", e ativa automaticamente assim que
+#   um controlador compatível for instalado), mas trate-a como uma camada
+#   ADICIONAL — não como a única barreira. As senhas fortes do Secret e o
+#   isolamento do namespace continuam sendo a primeira linha de defesa.
+#   Consulte a documentação oficial do K3s sobre CNIs e NetworkPolicy
+#   (https://docs.k3s.io/networking) para avaliar se compensa migrar para
+#   um CNI com enforcement antes de considerar esta camada 100% ativa.
+# ==============================================================================
+
+apiVersion: networking.k8s.io/v1
+# ↑ NetworkPolicy é um recurso "core" estável da API de rede do Kubernetes
+#   (a interpretação/enforcement dela é que depende do CNI, não a
+#   existência do recurso em si — por isso `kubectl apply` sempre funciona).
+
+kind: NetworkPolicy
+
+metadata:
+  name: postgres-allow-only-keycloak
+  namespace: authentication
+
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+      # ↑ Esta política se aplica aos Pods com o rótulo `app: postgres`
+      #   (ou seja: os Pods criados pelo Deployment em postgres-db.yaml).
+      #   É neles que as regras abaixo passam a valer.
+
+  policyTypes:
+    - Ingress
+    # ↑ Só estamos controlando tráfego de ENTRADA (quem pode se conectar
+    #   AO Postgres). Não restringimos tráfego de saída (Egress) do
+    #   Postgres neste arquivo — ele já não inicia conexões para fora.
+
+  ingress:
+    # ↑ Lista de regras de permissão. IMPORTANTE: assim que um Pod passa a
+    #   ter QUALQUER NetworkPolicy de Ingress aplicada a ele, o
+    #   comportamento padrão vira "negar tudo que não estiver
+    #   explicitamente permitido aqui" — ou seja, esta única regra abaixo
+    #   já é suficiente para bloquear todo o resto automaticamente (quando
+    #   houver um CNI com enforcement).
+
+    - from:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+              # ↑ Só permite conexões vindas de Pods com o rótulo
+              #   `app: keycloak` (as 2 réplicas criadas em keycloak.yaml)
+              #   — e apenas DENTRO do mesmo namespace "authentication"
+              #   (um `podSelector` sozinho, sem `namespaceSelector`, já
+              #   restringe implicitamente ao namespace desta própria
+              #   NetworkPolicy).
+
+      ports:
+        - protocol: TCP
+          port: 5432
+          # ↑ Restringe ainda mais: mesmo o Keycloak só pode falar com o
+          #   Postgres NESTA porta específica (a porta real do PostgreSQL),
+          #   fechando qualquer outra porta que o container eventualmente
+          #   exponha.
+
+# ==============================================================================
+# COMO TESTAR SE A POLÍTICA ESTÁ SENDO REALMENTE APLICADA (após instalar um
+# CNI com enforcement de NetworkPolicy):
+#   # Isto DEVE falhar (timeout/connection refused) — Vaultwarden não pode
+#   # falar com o Postgres:
+#   kubectl exec -n authentication deploy/vaultwarden -- \
+#     wget -qO- --timeout=5 postgres:5432 || echo "Bloqueado como esperado"
+#
+#   # Isto DEVE funcionar — Keycloak pode falar com o Postgres:
+#   kubectl exec -n authentication deploy/keycloak -- \
+#     nc -zv postgres 5432
+# ==============================================================================

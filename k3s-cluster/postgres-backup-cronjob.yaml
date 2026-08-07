@@ -1,0 +1,233 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/postgres-backup-cronjob.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Rodar `pg_dump` automaticamente todo dia de madrugada, gerando um
+#   backup compactado (.sql.gz) do banco do Keycloak, e apagar sozinho os
+#   backups com mais de 7 dias — sem depender de nenhuma ação manual.
+#
+# RECURSOS DECLARADOS NESTE ARQUIVO (em ordem lógica):
+#   1. PersistentVolumeClaim -> disco DEDICADO para os arquivos de backup,
+#      separado do disco de dados do Postgres (postgres-pvc). Propositalmente
+#      separado: se o disco de dados corromper, o volume de backup —
+#      fisicamente distinto — não é afetado.
+#   2. CronJob -> agenda e executa o `pg_dump` periodicamente.
+#
+# ⚠️ LIMITAÇÃO IMPORTANTE — LEIA
+#   Este backup fica salvo NO MESMO DISCO FÍSICO da VM (via
+#   local-path-provisioner). Isso protege contra erro humano (ex.: "DROP
+#   TABLE" acidental, upgrade de schema que corrompeu dados) e permite
+#   restaurar rapidamente, MAS NÃO protege contra perda física da VM
+#   inteira (disco queimado, incêndio, roubo do servidor). Para um
+#   ambiente de nível governamental, o recomendado é complementar isto com
+#   uma rotina (fora deste cluster, ex.: um `cron` no próprio sistema
+#   operacional da VM, ou um job adicional com `rclone`/`restic`) que copie
+#   periodicamente os arquivos de `/backups` para um local OFF-SITE
+#   (outro datacenter, nuvem, bucket S3-compatível, etc.).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1) PersistentVolumeClaim — disco dedicado para os arquivos de backup
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backup-pvc
+  namespace: authentication
+  labels:
+    app: postgres-backup
+
+spec:
+  accessModes:
+    - ReadWriteOnce
+    # ↑ Só o Pod do CronJob (que roda um de cada vez, nunca em paralelo —
+    #   ver `concurrencyPolicy` abaixo) precisa montar este disco.
+
+  storageClassName: local-path
+  # ↑ Mesma StorageClass padrão do K3s usada nos demais PVCs deste projeto.
+
+  resources:
+    requests:
+      storage: 5Gi
+      # ↑ 5 GiB é generoso para backups compactados de um banco de
+      #   metadados de autenticação (tende a ser poucos MB por dump). Com a
+      #   política de retenção de 7 dias configurada abaixo, o consumo real
+      #   fica bem menor que o limite.
+
+---
+# ------------------------------------------------------------------------------
+# 2) CronJob — executa o pg_dump todo dia às 03:00 (horário de Rondonópolis-MT)
+# ------------------------------------------------------------------------------
+apiVersion: batch/v1
+# ↑ CronJob vive no grupo de API "batch" (junto com Job), versão v1 estável.
+
+kind: CronJob
+# ↑ Um CronJob cria um novo Job (que por sua vez cria um Pod) automaticamente
+#   de acordo com uma expressão cron — igual ao `crontab` de um Linux comum,
+#   mas gerenciado nativamente pelo Kubernetes.
+
+metadata:
+  name: postgres-backup
+  namespace: authentication
+
+spec:
+  schedule: "0 3 * * *"
+  # ↑ Expressão cron: minuto=0, hora=3, todo dia, todo mês, todo dia da
+  #   semana -> executa TODOS OS DIAS às 03:00. Horário de baixíssimo uso
+  #   do sistema, minimizando qualquer impacto de performance do `pg_dump`
+  #   sobre o Keycloak em produção.
+
+  timeZone: "America/Cuiaba"
+  # ↑ Fuso horário de Rondonópolis-MT (UTC-4). Sem este campo, o
+  #   Kubernetes interpretaria "03:00" como UTC, o que executaria o backup
+  #   às 23:00 (horário local) — ainda de madrugada, mas não exatamente às
+  #   3h como pretendido. Requer Kubernetes 1.27+ (o K3s atual já atende).
+
+  concurrencyPolicy: Forbid
+  # ↑ Se por algum motivo um backup do dia anterior ainda estiver rodando
+  #   quando o horário do próximo chegar, o Kubernetes NÃO inicia um
+  #   segundo em paralelo (evita dois `pg_dump` disputando I/O de disco ao
+  #   mesmo tempo, ou dois processos escrevendo no mesmo arquivo).
+
+  successfulJobsHistoryLimit: 3
+  # ↑ Mantém o HISTÓRICO (metadados, não os arquivos) dos últimos 3 Jobs
+  #   bem-sucedidos visível via `kubectl get jobs -n authentication` — útil
+  #   para auditoria de quando cada backup rodou.
+
+  failedJobsHistoryLimit: 3
+  # ↑ Mesma ideia, mas para execuções que FALHARAM — facilita investigar o
+  #   que deu errado sem precisar já ter configurado um sistema de logs
+  #   centralizado.
+
+  jobTemplate:
+    # ↑ Molde do Job que será criado a cada disparo do agendamento.
+    spec:
+      backoffLimit: 2
+      # ↑ Se o backup falhar (ex.: banco temporariamente indisponível),
+      #   tenta novamente até 2 vezes antes de marcar o Job como falho de
+      #   vez — evita que uma instabilidade momentânea gere um dia inteiro
+      #   sem backup.
+
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # ↑ CronJobs/Jobs não podem usar `Always` — `OnFailure` faz o
+          #   Kubernetes tentar rodar o container de novo (respeitando o
+          #   `backoffLimit` acima) se ele sair com erro.
+
+          containers:
+            - name: pg-dump-backup
+              image: postgres:16-alpine
+              # ↑ Mesma imagem/versão usada pelo banco em si — GARANTE que
+              #   a versão do utilitário `pg_dump` seja 100% compatível com
+              #   a versão do servidor PostgreSQL que está gerando o backup
+              #   (evita erros sutis de incompatibilidade entre versões).
+
+              env:
+                - name: PGHOST
+                  value: "postgres"
+                  # ↑ Nome do Service do Postgres (mesmo hostname interno
+                  #   usado pelo Keycloak) — resolvido via DNS do cluster.
+
+                - name: PGPORT
+                  value: "5432"
+
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: auth-stack-credentials
+                      key: POSTGRES_USER
+                  # ↑ `PGUSER`/`PGPASSWORD`/`PGDATABASE` são variáveis de
+                  #   ambiente PADRÃO reconhecidas automaticamente pelas
+                  #   ferramentas de linha de comando do Postgres
+                  #   (`pg_dump`, `psql`, etc.) — não precisamos passar
+                  #   flags extras no comando por causa disso.
+
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: auth-stack-credentials
+                      key: POSTGRES_PASSWORD
+
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: auth-stack-credentials
+                      key: POSTGRES_DB
+
+              command:
+                - "/bin/sh"
+                - "-c"
+                - |
+                  # ↑ Script de shell executado dentro do container a cada disparo.
+                  set -e
+                  # ↑ Interrompe o script imediatamente se qualquer comando falhar
+                  #   (em vez de seguir adiante e mascarar o erro).
+
+                  DATA_HORA=$(date +%Y%m%d_%H%M%S)
+                  # ↑ Timestamp usado no nome do arquivo, ex.: 20260807_030000.
+
+                  ARQUIVO="/backups/keycloak_${DATA_HORA}.sql.gz"
+                  # ↑ Caminho final do backup, já com o carimbo de data/hora
+                  #   no nome, para nunca sobrescrever um backup anterior.
+
+                  echo "Iniciando backup do banco '${PGDATABASE}' em ${ARQUIVO}..."
+
+                  pg_dump --no-owner --no-privileges | gzip -9 > "${ARQUIVO}"
+                  # ↑ `pg_dump` gera o dump em formato SQL puro (texto);
+                  #   `--no-owner --no-privileges` evita gravar comandos de
+                  #   ALTER OWNER/GRANT específicos do usuário atual, o que
+                  #   facilita restaurar em outro ambiente/usuário no
+                  #   futuro; `gzip -9` compacta no nível máximo, economizando
+                  #   espaço em disco.
+
+                  echo "Backup concluído: ${ARQUIVO} ($(du -h "${ARQUIVO}" | cut -f1))"
+
+                  echo "Removendo backups com mais de 7 dias..."
+                  find /backups -name "keycloak_*.sql.gz" -type f -mtime +7 -delete
+                  # ↑ Política de retenção: apaga automaticamente qualquer
+                  #   arquivo de backup criado há mais de 7 dias — evita que
+                  #   o disco de backup encha com o passar do tempo.
+
+                  echo "Backups atuais em /backups:"
+                  ls -lh /backups
+
+              volumeMounts:
+                - name: backup-storage
+                  mountPath: /backups
+                  # ↑ Monta o PVC dedicado de backup (criado no início deste
+                  #   arquivo) neste caminho dentro do container.
+
+              resources:
+                # ↑ O `pg_dump` roda por poucos segundos/minutos, uma vez
+                #   por dia — não precisa de reserva permanente de recursos,
+                #   apenas um teto para não competir com o restante da
+                #   stack caso rode em um momento de pico inesperado.
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "256Mi"
+
+          volumes:
+            - name: backup-storage
+              persistentVolumeClaim:
+                claimName: postgres-backup-pvc
+                # ↑ Conecta este Pod ao PVC dedicado de backup criado acima.
+
+# ==============================================================================
+# COMO RESTAURAR UM BACKUP MANUALMENTE (procedimento de emergência):
+#   1. Liste os backups disponíveis:
+#        kubectl exec -n authentication deploy/postgres -- \
+#          sh -c "ls -lh /backups" 2>/dev/null || \
+#        kubectl run -n authentication restore-helper --rm -it \
+#          --image=postgres:16-alpine --restart=Never \
+#          --overrides='{"spec":{"containers":[{"name":"restore-helper","image":"postgres:16-alpine","command":["sh"],"stdin":true,"tty":true,"volumeMounts":[{"name":"b","mountPath":"/backups"}]}],"volumes":[{"name":"b","persistentVolumeClaim":{"claimName":"postgres-backup-pvc"}}]}}'
+#   2. Copie o arquivo desejado para fora do cluster, se necessário:
+#        kubectl cp authentication/<pod-com-volume-montado>:/backups/keycloak_XXXXXXXX.sql.gz ./backup-local.sql.gz
+#   3. Restaure no banco (ATENÇÃO: sobrescreve dados existentes):
+#        gunzip -c backup-local.sql.gz | \
+#          kubectl exec -i -n authentication deploy/postgres -- \
+#          psql -U keycloak_admin -d keycloak
+# ==============================================================================
