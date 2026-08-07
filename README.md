@@ -116,6 +116,8 @@ keycloak-k3s/
 ├── .github/
 │   └── workflows/
 │       └── deploy.yml                   # Pipeline GitOps (self-hosted runner, 14 passos)
+├── scripts/
+│   └── bootstrap-vm.sh                  # Script único: K3s + cert-manager + kubectl + runner
 ├── k3s-cluster/
 │   ├── namespaces.yaml                  # Namespace "authentication"
 │   ├── secrets.yaml                     # Credenciais (Postgres, Keycloak, Vaultwarden)
@@ -144,11 +146,47 @@ keycloak-k3s/
 - Firewall/roteador com capacidade de liberar **apenas** as portas
   **80 e 443** de entrada para o IP público da VM.
 
-### 4.2. Instalar o K3s + cert-manager (bootstrap único do cluster)
+### 4.2. Opção A (recomendada): script único de bootstrap automatizado
 
-Conecte-se na VM (localmente ou via um acesso já existente — este é o
-ÚNICO momento em que você toca a VM manualmente para instalar software de
-infraestrutura; depois disso, a aplicação em si é 100% GitOps) e rode:
+Em vez de digitar os comandos das seções 4.3 a 4.5 um por um, o script
+[`scripts/bootstrap-vm.sh`](scripts/bootstrap-vm.sh) faz tudo de uma vez:
+instala o K3s, instala o cert-manager, configura o `kubectl` para o seu
+usuário e — se você fornecer um token do GitHub — registra e inicia o
+Self-Hosted Runner. É **idempotente**: rodar de novo depois não quebra nada
+(cada etapa verifica se já foi feita antes de agir), então também serve
+para "consertar" uma VM que ficou pela metade.
+
+```bash
+# Dentro da VM, clone o repositório (ou copie só este script via scp):
+git clone https://github.com/yurythx/keycloak-k3s.git
+cd keycloak-k3s
+chmod +x scripts/bootstrap-vm.sh
+
+# Opção sem registro automático do runner (registra na mão depois, seção 4.5):
+sudo ./scripts/bootstrap-vm.sh
+
+# Opção com registro automático do runner — gere antes um Personal Access
+# Token em GitHub: Settings → Developer settings → Personal access tokens →
+# Fine-grained → permissão "Administration: Read and write" NO REPOSITÓRIO
+# keycloak-k3s (não precisa de acesso a outros repositórios):
+sudo GH_PAT="ghp_xxx_seu_token" ./scripts/bootstrap-vm.sh
+```
+
+O script imprime, ao final, exatamente o que ainda falta fazer fora dele
+(editar segredos, DNS, port-forward) — pule direto para a seção 4.6.
+
+> O token (`GH_PAT`) só é usado em memória, na hora de chamar a API do
+> GitHub para pegar um token de registro temporário (válido ~1h) — nunca é
+> salvo em disco pelo script. Prefira um token com validade curta (ex.: 7
+> dias) e revogue-o depois de usar, se quiser ser ainda mais conservador.
+
+Se preferir entender/rodar cada comando manualmente (ou se algo no script
+falhar e você precisar diagnosticar um passo específico), siga a **Opção B**
+abaixo — é exatamente o que o script automatiza por baixo dos panos.
+
+### 4.3. Opção B: instalar o K3s + cert-manager manualmente
+
+Conecte-se na VM (localmente ou via um acesso já existente) e rode:
 
 ```bash
 # 1) Instala o K3s como um único binário, já com Traefik e o
@@ -189,7 +227,7 @@ kubectl get pods -n cert-manager -w
 > até você, opcionalmente, migrar para um CNI com suporte a enforcement
 > (ex.: Calico). Veja o comentário completo dentro do próprio arquivo.
 
-### 4.3. Configurar o `kubectl` para o usuário do Runner
+### 4.4. Configurar o `kubectl` para o usuário do Runner
 
 ```bash
 # Cria a pasta padrão de configuração do kubectl para o seu usuário.
@@ -206,7 +244,10 @@ sudo chown $(id -u):$(id -g) ~/.kube/config
 kubectl get nodes
 ```
 
-### 4.4. Registrar o Self-Hosted Runner do GitHub Actions
+### 4.5. Registrar o Self-Hosted Runner do GitHub Actions
+
+> Pule esta seção se você já rodou o script da seção 4.2 com `GH_PAT`
+> definido — o runner já está registrado e ativo.
 
 No GitHub: **Settings → Actions → Runners → New self-hosted runner**
 (no repositório `keycloak-k3s`), selecione **Linux/x64**, e copie os
@@ -244,7 +285,7 @@ sudo ./svc.sh status
 > porta de entrada no firewall para o runner funcionar. Rode-o com um
 > usuário Linux SEM privilégios de root (o instalador já orienta isso).
 
-### 4.5. Trocar as senhas fictícias (único ajuste de conteúdo pendente)
+### 4.6. Trocar as senhas fictícias (único ajuste de conteúdo pendente)
 
 Os domínios (`sso.rondonopolis.mt.gov.br` e `cofre.rondonopolis.mt.gov.br`)
 já estão configurados em `ingress.yaml`, `keycloak.yaml` e
@@ -260,7 +301,7 @@ de ir para produção de verdade:
 3. Aponte os registros DNS tipo **A** de `sso.rondonopolis.mt.gov.br` e
    `cofre.rondonopolis.mt.gov.br` para o IP público definitivo da VM.
 
-### 4.6. Disparar o primeiro deploy
+### 4.7. Disparar o primeiro deploy
 
 ```bash
 git add .
@@ -279,7 +320,7 @@ Keycloak → Vaultwarden → ClusterIssuer (cert-manager) → Ingress.
 > sem bloquear o resto da stack — assim que o DNS propagar, ele completa
 > sozinho, sem precisar rodar o workflow de novo.
 
-### 4.7. Validar a implantação
+### 4.8. Validar a implantação
 
 ```bash
 kubectl get pods -n authentication -o wide

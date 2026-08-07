@@ -1,0 +1,26 @@
+# ==============================================================================
+# ARQUIVO: .gitattributes
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Garantir que scripts shell (.sh) sejam sempre armazenados e distribuídos
+#   com fim de linha LF (Unix), independentemente do sistema operacional ou
+#   da configuração `core.autocrlf` de quem estiver clonando/commitando.
+#
+#   Por que isso importa aqui: scripts/bootstrap-vm.sh RODA DENTRO DA VM
+#   LINUX. Se o Git convertesse os fins de linha para CRLF (Windows) em
+#   algum checkout, a primeira linha do script (`#!/usr/bin/env bash\r`)
+#   quebraria com o erro clássico "bad interpreter: No such file or
+#   directory" — o `\r` extra não faz parte do caminho do interpretador.
+# ==============================================================================
+
+*.sh text eol=lf
+# ↑ Qualquer arquivo .sh: tratado como texto (`text`) e sempre gravado/
+#   distribuído com fim de linha LF (`eol=lf`), mesmo que alguém clone este
+#   repositório numa máquina Windows com `core.autocrlf=true`.
+
+*.yaml text eol=lf
+*.yml text eol=lf
+# ↑ Mesma garantia para os manifestos Kubernetes e workflows do GitHub
+#   Actions — YAML tolera CRLF na prática, mas manter tudo em LF evita
+#   diffs "sujos" (com todas as linhas marcadas como alteradas só por causa
+#   do fim de linha) entre commits feitos em SOs diferentes.
