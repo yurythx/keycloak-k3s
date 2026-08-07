@@ -168,7 +168,8 @@ spec:
                   -s 'config.editMode=["READ_ONLY"]' \
                   -s 'config.syncRegistrations=["false"]' \
                   -s 'config.importEnabled=["true"]' \
-                  -s 'config.pagination=["true"]'
+                  -s 'config.pagination=["true"]' \
+                  -s 'config.customUserSearchFilter=["(objectCategory=person)"]'
                 echo "   Provider criado com sucesso."
               fi
 
@@ -202,6 +203,20 @@ spec:
           #                                 dos dados do usuário após o
           #                                 primeiro login/sync (performance
           #                                 — evita bater no AD toda hora).
+          #     customUserSearchFilter   -> ⚠️ CRÍTICO: sem este filtro, o
+          #     =(objectCategory=person)    primeiro teste real trouxe 5797
+          #                                 "usuários" — na prática, quase
+          #                                 tudo eram CONTAS DE COMPUTADOR
+          #                                 (ex.: "abaco-02745$") e contas de
+          #                                 serviço, não pessoas. No AD, um
+          #                                 objeto "computador" também tem
+          #                                 objectClass=user (é uma subclasse
+          #                                 de user), então filtrar só por
+          #                                 objectClass não separa pessoas de
+          #                                 máquinas. "objectCategory=person"
+          #                                 é o filtro padrão do AD para
+          #                                 isolar só contas humanas de
+          #                                 verdade.
 
           env:
             - name: KC_ADMIN_USER
