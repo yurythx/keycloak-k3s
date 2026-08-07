@@ -93,8 +93,16 @@ spec:
               KCADM=/opt/keycloak/bin/kcadm.sh
 
               echo ">> Aguardando o Keycloak responder antes de configurar..."
+              # ↑ Usamos o recurso embutido do bash /dev/tcp/HOST/PORTA em vez
+              #   de `curl`, porque a imagem oficial do Keycloak (baseada em
+              #   UBI mínima) NÃO tem curl instalado — só o que o próprio
+              #   Keycloak/JVM precisam para rodar. Um simples "a porta 8080
+              #   do Service 'keycloak' aceita conexão?" já é um bom proxy de
+              #   prontidão aqui: o Service só encaminha tráfego para Pods que
+              #   já passaram no readinessProbe (ver keycloak.yaml).
               for i in $(seq 1 30); do
-                if curl -sf "http://keycloak:8080/realms/master" > /dev/null; then
+                if (exec 3<>/dev/tcp/keycloak/8080) 2>/dev/null; then
+                  exec 3<&- 3>&-
                   echo ">> Keycloak respondeu, prosseguindo."
                   break
                 fi
