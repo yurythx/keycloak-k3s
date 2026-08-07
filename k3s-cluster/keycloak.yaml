@@ -324,23 +324,29 @@ spec:
 
             # --- Clustering (cache distribuído entre as 2 réplicas) --------
             - name: KC_CACHE
-              value: "ha"
-              # ↑ "ha" (high availability) ativa o modo de cache distribuído
-              #   do Infinispan, replicando sessões de login entre os Pods —
-              #   sem isso, cada réplica teria sua própria "memória" isolada
-              #   e o usuário seria deslogado ao alternar de Pod.
+              value: "ispn"
+              # ↑ ⚠️ Os únicos valores aceitos pelo Keycloak 26 são "ispn"
+              #   (cache distribuído via Infinispan — o que queremos) ou
+              #   "local" (cada Pod isolado, sem HA). "ha" NÃO é um valor
+              #   válido (causava o erro "Invalid value for option
+              #   'KC_CACHE': ha. Expected values are: ispn, local" e
+              #   CrashLoopBackOff). Com "ispn", as sessões de login são
+              #   replicadas entre os Pods — sem isso, cada réplica teria
+              #   sua própria "memória" isolada e o usuário seria deslogado
+              #   ao alternar de Pod.
 
             - name: KC_CACHE_STACK
               value: "kubernetes"
               # ↑ Usa o protocolo de descoberta KUBE_PING (via API do
               #   Kubernetes, usando a permissão RBAC criada na seção 1) para
               #   os Pods se encontrarem automaticamente — não exige
-              #   configuração manual de IPs.
-
-            - name: KC_CACHE_CONFIG_FILE
-              value: "cache-ha.xml"
-              # ↑ Arquivo de configuração de cache HA que já acompanha a
-              #   imagem oficial do Keycloak — não precisa ser criado por nós.
+              #   configuração manual de IPs. Não precisamos declarar
+              #   KC_CACHE_CONFIG_FILE: o Keycloak já usa o arquivo padrão
+              #   de cache distribuído (cache-ispn.xml, embutido na imagem)
+              #   automaticamente quando KC_CACHE=ispn — só seria necessário
+              #   apontar um arquivo customizado aqui se, no futuro,
+              #   fôssemos montar uma configuração de cache própria via
+              #   ConfigMap.
 
           resources:
             # ↑ Ajustado para caber confortavelmente em uma VM de 8GB
