@@ -6,41 +6,48 @@
 #   Automatizar TUDO que é instalação de software na VM (o que antes era feito
 #   copiando/colando comandos manualmente, seção 4.2-4.4 do README.md):
 #     1. Instalar o K3s.
-#     2. Instalar o cert-manager (HTTPS automático via Let's Encrypt).
-#     3. Configurar o kubectl para o seu usuário comum (sem precisar de root).
-#     4. Registrar e iniciar o Self-Hosted Runner do GitHub Actions.
+#     2. Configurar o kubectl para o seu usuário comum (sem precisar de root).
+#     3. Registrar e iniciar o Self-Hosted Runner do GitHub Actions.
 #
 #   É IDEMPOTENTE: rodar de novo depois de já ter rodado uma vez não quebra
 #   nada — cada etapa verifica se já foi feita antes de agir.
 #
+# ⚠️ NÃO INSTALA cert-manager DE PROPÓSITO
+#   Nesta instalação, o HTTPS público é terminado por um servidor Nginx já
+#   existente na rede da prefeitura (fora deste cluster) — ver
+#   `nginx-edge/`. O Traefik dentro do K3s só fala HTTP internamente, então
+#   não há necessidade de emitir certificados dentro do cluster. Se um dia a
+#   arquitetura mudar (Traefik passar a terminar TLS diretamente), o
+#   cert-manager pode ser adicionado de volta — não é o caso hoje.
+#
 # O QUE ESTE SCRIPT **NÃO** FAZ (e por quê)
-#   - Port-forward das portas 80/443 no roteador/firewall de borda: depende
-#     do seu roteador/Proxmox especificamente, que este script não consegue
-#     alcançar nem identificar automaticamente.
+#   - Configurar o Nginx da borda: é um servidor separado, fora desta VM —
+#     ver os arquivos de referência em `nginx-edge/`.
+#   - Port-forward/roteamento de rede até o Nginx da borda: depende da
+#     topologia da rede da prefeitura, que este script não alcança.
 #   - Criar os registros DNS (sso.rondonopolis.mt.gov.br / cofre.…): depende
-#     do provedor de DNS da prefeitura (painel próprio, Registro.br, etc.),
-#     que também está fora do alcance deste script.
-#   - Trocar as senhas fictícias em k3s-cluster/secrets.yaml e o e-mail em
-#     k3s-cluster/cert-manager-issuer.yaml: são decisões de conteúdo, não de
-#     infraestrutura — continuam sendo editadas no repositório (fora da VM)
-#     e enviadas via `git push`, como manda o GitOps.
+#     do provedor de DNS da prefeitura, fora do alcance deste script.
+#   - Trocar as senhas fictícias em k3s-cluster/secrets.yaml e o IP do Nginx
+#     em k3s-cluster/traefik-trusted-headers.yaml: são decisões de
+#     conteúdo, não de infraestrutura — continuam sendo editadas no
+#     repositório (fora da VM) e enviadas via `git push`, como manda o GitOps.
 #
 # COMO USAR
 #   1. Copie este script para a VM (scp, git clone do repositório, etc.).
 #   2. Dê permissão de execução:
 #        chmod +x scripts/bootstrap-vm.sh
-#   3. Rode com sudo (precisa de root para instalar o K3s e o cert-manager):
+#   3. Rode com sudo (precisa de root para instalar o K3s):
 #
 #        sudo ./scripts/bootstrap-vm.sh
 #
-#      Para TAMBÉM registrar o runner automaticamente (passo 4), gere um
+#      Para TAMBÉM registrar o runner automaticamente (passo 3), gere um
 #      Personal Access Token no GitHub (Settings → Developer settings →
 #      Personal access tokens → Fine-grained → dê permissão "Administration:
 #      Read and write" NO REPOSITÓRIO keycloak-k3s) e rode:
 #
 #        sudo GH_PAT="ghp_xxx_seu_token" ./scripts/bootstrap-vm.sh
 #
-#      Sem GH_PAT, o script faz os passos 1-3 (cluster) e imprime as
+#      Sem GH_PAT, o script faz os passos 1-2 (cluster) e imprime as
 #      instruções manuais do runner no final, sem quebrar a execução.
 #
 #      ⚠️ O token é usado apenas em memória para chamar a API do GitHub e
@@ -75,7 +82,7 @@ RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner}"
 # ↑ Pasta onde o agente do runner será instalado.
 
 GH_PAT="${GH_PAT:-}"
-# ↑ Personal Access Token opcional — se vazio, o passo 4 (runner) é pulado
+# ↑ Personal Access Token opcional — se vazio, o passo 3 (runner) é pulado
 #   com instruções manuais impressas no final.
 
 # ------------------------------------------------------------------------------
@@ -95,7 +102,7 @@ log_aviso() { echo -e "${COR_AVISO}[AVISO]${COR_RESET} $*"; }
 # ------------------------------------------------------------------------------
 if [[ "${EUID}" -ne 0 ]]; then
   # ↑ $EUID = ID efetivo do usuário atual. 0 = root. Precisamos de root para
-  #   instalar o K3s (que cria serviços systemd) e aplicar o cert-manager.
+  #   instalar o K3s (que cria serviços systemd).
   echo "Rode este script com sudo: sudo $0" >&2
   exit 1
 fi
@@ -154,32 +161,14 @@ chown -R "${TARGET_USER}":"${TARGET_USER}" "${KUBE_DIR}"
 chmod 600 "${KUBE_CONFIG}"
 log_ok "kubeconfig copiado para ${KUBE_CONFIG} (dono: ${TARGET_USER})."
 
-# Usamos este kubeconfig para todos os `kubectl` seguintes neste script,
-# rodando como o usuário alvo (evita misturar permissões de root/usuário).
-KUBECTL_CMD=(sudo -u "${TARGET_USER}" env KUBECONFIG="${KUBE_CONFIG}" kubectl)
-
 # ==============================================================================
-# PASSO 3 — Instalar o cert-manager
-# ==============================================================================
-if "${KUBECTL_CMD[@]}" get namespace cert-manager >/dev/null 2>&1; then
-  log_ok "cert-manager já está instalado — pulando instalação."
-else
-  log_info "Instalando o cert-manager (emissão automática de HTTPS)..."
-  "${KUBECTL_CMD[@]}" apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-  log_info "Aguardando os Pods do cert-manager ficarem prontos (até 2 minutos)..."
-  "${KUBECTL_CMD[@]}" wait --for=condition=Available --timeout=120s \
-    -n cert-manager deployment --all
-  log_ok "cert-manager instalado e pronto."
-fi
-
-# ==============================================================================
-# PASSO 4 — Registrar e iniciar o Self-Hosted Runner do GitHub Actions
+# PASSO 3 — Registrar e iniciar o Self-Hosted Runner do GitHub Actions
 # ==============================================================================
 if [[ -f "${RUNNER_DIR}/.runner" ]]; then
   log_ok "Runner já está configurado em ${RUNNER_DIR} — pulando registro."
 elif [[ -z "${GH_PAT}" ]]; then
   log_aviso "Variável GH_PAT não definida — pulando registro automático do runner."
-  log_aviso "Registre manualmente (ver README.md, seção 4.4) ou rode de novo com:"
+  log_aviso "Registre manualmente (ver README.md, seção 4.5) ou rode de novo com:"
   log_aviso "  sudo GH_PAT=\"seu_token\" $0"
 else
   log_info "Buscando a versão mais recente do GitHub Actions Runner..."
@@ -258,21 +247,24 @@ log_ok "Bootstrap de infraestrutura concluído."
 echo
 echo "O que já está pronto nesta VM:"
 echo "  ✔ K3s rodando (Traefik + local-path-provisioner inclusos)."
-echo "  ✔ cert-manager instalado."
 echo "  ✔ kubectl configurado para o usuário '${TARGET_USER}'."
 if [[ -f "${RUNNER_DIR}/.runner" ]]; then
   echo "  ✔ Self-Hosted Runner '${RUNNER_NAME}' registrado e ativo."
 else
   echo "  ✘ Self-Hosted Runner NÃO registrado (rode de novo com GH_PAT definido,"
-  echo "    ou registre manualmente — ver README.md seção 4.4)."
+  echo "    ou registre manualmente — ver README.md seção 4.5)."
 fi
 echo
 echo "O que ainda depende de você, fora desta VM:"
-echo "  1. Editar k3s-cluster/secrets.yaml (trocar senhas fictícias) e"
-echo "     k3s-cluster/cert-manager-issuer.yaml (trocar o e-mail), no seu"
-echo "     computador, e dar 'git push origin main' para a pipeline aplicar."
-echo "  2. Configurar os registros DNS tipo A:"
-echo "       sso.rondonopolis.mt.gov.br    -> IP público desta VM"
-echo "       cofre.rondonopolis.mt.gov.br  -> IP público desta VM"
-echo "  3. Se esta VM estiver atrás de NAT (Proxmox/roteador), liberar o"
-echo "     port-forward das portas 80 e 443 para o IP interno dela."
+echo "  1. Descobrir o IP interno desta VM (rode: hostname -I) e o IP interno"
+echo "     do servidor Nginx da borda — vai precisar dos dois a seguir."
+echo "  2. No seu computador, editar e enviar (git push) para este repositório:"
+echo "     - k3s-cluster/secrets.yaml            (trocar as senhas fictícias)"
+echo "     - k3s-cluster/traefik-trusted-headers.yaml (colocar o IP real do"
+echo "       Nginx da borda, para o Traefik confiar no X-Forwarded-Proto)"
+echo "  3. No servidor Nginx da borda, copiar/adaptar os arquivos de"
+echo "     nginx-edge/*.conf, apontando 'proxy_pass' para o IP desta VM."
+echo "  4. Configurar os registros DNS tipo A apontando para o IP PÚBLICO do"
+echo "     Nginx da borda (não desta VM):"
+echo "       sso.rondonopolis.mt.gov.br"
+echo "       cofre.rondonopolis.mt.gov.br"

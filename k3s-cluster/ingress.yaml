@@ -2,40 +2,46 @@
 # ARQUIVO: k3s-cluster/ingress.yaml
 # ------------------------------------------------------------------------------
 # OBJETIVO
-#   Expor o Keycloak e o Vaultwarden para a internet através de DOIS
-#   domínios distintos, usando o Traefik — o Ingress Controller que já vem
-#   INSTALADO POR PADRÃO em qualquer cluster K3s (não precisa instalar Nginx
-#   Ingress nem nada extra).
+#   Rotear as requisições HTTP que chegam ao Traefik (dentro do K3s) para o
+#   Keycloak ou o Vaultwarden, de acordo com o domínio (Host header):
 #
 #   sso.rondonopolis.mt.gov.br   -> Service "keycloak"   (porta 8080)
 #   cofre.rondonopolis.mt.gov.br -> Service "vaultwarden" (porta 80)
 #
-# COMO FUNCIONA O ROTEAMENTO
-#   O Traefik recebe TODO o tráfego HTTP/HTTPS que chega na VM (ele já
-#   ocupa as portas 80 e 443 do host por padrão no K3s) e, com base no
-#   cabeçalho "Host" da requisição, decide para qual Service interno
-#   encaminhar — é assim que conseguimos hospedar 2 aplicações diferentes
-#   usando o mesmo IP público e as mesmas portas 80/443.
+# ⚠️ ARQUITETURA DE REDE DESTA INSTALAÇÃO — LEIA ANTES DE MEXER
+#   Diferente de uma instalação "padrão" (onde o próprio Traefik do K3s
+#   ficaria exposto direto na internet e teria que emitir seu próprio
+#   certificado HTTPS), AQUI já existe um servidor **Nginx isolado na rede
+#   da prefeitura** que fica na borda, recebe TODO o tráfego HTTPS público,
+#   TERMINA o TLS (guarda o certificado real) e repassa a requisição já
+#   decodificada, em HTTP puro, para este cluster K3s.
 #
-# ⚠️ SOBRE TLS/HTTPS (cert-manager já habilitado neste arquivo)
-#   Este Ingress já está configurado para pedir automaticamente um
-#   certificado HTTPS válido (Let's Encrypt) via cert-manager, através da
-#   annotation `cert-manager.io/cluster-issuer` e do bloco `tls:` abaixo.
-#   ISSO SÓ FUNCIONA DEPOIS que você instalar o cert-manager e aplicar o
-#   ClusterIssuer definido em `k3s-cluster/cert-manager-issuer.yaml` — veja
-#   o passo a passo de bootstrap único no README.md, seção "Bootstrap único
-#   do cluster". Até lá, o Traefik responde em HTTPS com um certificado
-#   autoassinado (gera alerta no navegador, mas o tráfego já é criptografado)
-#   e o cert-manager, assim que instalado, substitui automaticamente esse
-#   certificado pelo válido — sem precisar editar este arquivo de novo.
+#   Por isso:
+#     - Este Ingress NÃO declara bloco `tls:` nem annotation de
+#       cert-manager — o certificado "de verdade" não vive aqui, vive no
+#       Nginx da borda. O Traefik deste cluster só precisa falar HTTP.
+#     - O Traefik só escuta na entrypoint "web" (porta 80). A entrypoint
+#       "websecure" (443) do K3s simplesmente não é usada nesta topologia.
+#     - Para o Keycloak/Vaultwarden ainda assim SABEREM que a requisição
+#       original do usuário veio por HTTPS (importante para gerar URLs e
+#       cookies corretos), o Nginx da borda precisa enviar o cabeçalho
+#       `X-Forwarded-Proto: https`, e o Traefik precisa CONFIAR nesse
+#       cabeçalho em vez de sobrescrevê-lo — isso é configurado em
+#       `k3s-cluster/traefik-trusted-headers.yaml` (leia os comentários lá,
+#       é uma peça CRÍTICA desta cadeia, não pule esse arquivo).
+#     - A configuração do lado do Nginx (os blocos `server { ... }` que
+#       apontam para este cluster) fica documentada em `nginx-edge/`, na
+#       raiz deste repositório — não é aplicada via kubectl (o Nginx não
+#       roda dentro do K3s), é só a referência para você colar na
+#       configuração existente do seu servidor Nginx.
 # ==============================================================================
 
 apiVersion: networking.k8s.io/v1
 # ↑ Versão estável (GA) da API de Ingress do Kubernetes.
 
 kind: Ingress
-# ↑ Um Ingress é a "porta de entrada" HTTP/HTTPS do cluster — traduz nomes
-#   de domínio + caminhos em tráfego roteado para Services internos.
+# ↑ Um Ingress é a "porta de entrada" HTTP do cluster — traduz nomes de
+#   domínio + caminhos em tráfego roteado para Services internos.
 
 metadata:
   name: auth-stack-ingress
@@ -43,27 +49,14 @@ metadata:
 
   annotations:
     # ↑ Annotations são metadados EXTRAS lidos pelo Ingress Controller
-    #   (Traefik) e pelo cert-manager para comportamentos específicos que a
-    #   spec genérica do Kubernetes não cobre.
+    #   (Traefik) para comportamentos específicos que a spec genérica do
+    #   Kubernetes não cobre.
 
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure,web
-    # ↑ Diz ao Traefik para escutar este Ingress tanto na entrypoint
-    #   "web" (porta 80/HTTP) quanto "websecure" (porta 443/HTTPS) — os
-    #   dois entrypoints já vêm criados por padrão na instalação do K3s.
-    #   A entrypoint "web" (80) continua ativa porque o desafio HTTP-01 do
-    #   Let's Encrypt (usado pelo cert-manager para provar que você é dono
-    #   do domínio) é respondido em texto plano, na porta 80.
-
-    traefik.ingress.kubernetes.io/router.tls: "true"
-    # ↑ Ativa TLS (HTTPS) para este roteador.
-
-    cert-manager.io/cluster-issuer: "letsencrypt-prod"
-    # ↑ Diz ao cert-manager (depois de instalado — ver README) "monitore
-    #   este Ingress e emita/renove automaticamente um certificado Let's
-    #   Encrypt válido para os hosts declarados nele, usando o emissor
-    #   ClusterIssuer chamado 'letsencrypt-prod'" (definido em
-    #   cert-manager-issuer.yaml). A renovação (a cada ~60 dias) também é
-    #   automática — nenhuma ação manual necessária depois de configurado.
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    # ↑ Diz ao Traefik para escutar este Ingress SÓ na entrypoint "web"
+    #   (porta 80/HTTP) — é só o que chega vindo do Nginx da borda. Não
+    #   incluímos "websecure" (443) porque, nesta topologia, ninguém fala
+    #   HTTPS diretamente com o Traefik deste cluster.
 
 spec:
   ingressClassName: traefik
@@ -71,28 +64,18 @@ spec:
   #   'traefik' para processar este recurso" — é o nome padrão da
   #   IngressClass já registrada de fábrica pelo K3s.
 
-  tls:
-    # ↑ Ativo desde já: instrui o Traefik a servir HTTPS para os hosts
-    #   abaixo usando o certificado guardado no Secret indicado em
-    #   `secretName`. Esse Secret é criado e mantido AUTOMATICAMENTE pelo
-    #   cert-manager assim que ele estiver instalado e o ClusterIssuer
-    #   aplicado — você não precisa criá-lo manualmente.
-    - hosts:
-        - sso.rondonopolis.mt.gov.br
-        - cofre.rondonopolis.mt.gov.br
-      secretName: auth-stack-tls-cert
-      # ↑ Nome do Secret (tipo `kubernetes.io/tls`) onde o cert-manager vai
-      #   armazenar o certificado + chave privada emitidos pelo Let's
-      #   Encrypt, cobrindo os dois domínios acima.
-
   rules:
     # ↑ Lista de regras de roteamento — cada item associa um domínio
-    #   (host) a um Service de destino.
+    #   (host) a um Service de destino. O Traefik decide qual regra usar
+    #   com base no cabeçalho "Host" que o Nginx da borda REPASSA
+    #   integralmente na requisição (por isso o Nginx precisa enviar
+    #   `proxy_set_header Host $host;` — ver nginx-edge/).
 
     - host: sso.rondonopolis.mt.gov.br
       # ↑ Domínio público do Keycloak (SSO da prefeitura de Rondonópolis).
-      #   Precisa ter um registro DNS tipo A apontando para o IP público
-      #   da VM (configurado FORA deste repositório, no provedor de DNS).
+      #   O registro DNS tipo A deste domínio deve apontar para o IP
+      #   PÚBLICO DO NGINX DA BORDA — não para o IP desta VM do K3s, que
+      #   nesta topologia não precisa ter nenhum IP público.
 
       http:
         paths:
@@ -113,8 +96,8 @@ spec:
                   #   do Service "keycloak".
 
     - host: cofre.rondonopolis.mt.gov.br
-      # ↑ Domínio público do Vaultwarden — também precisa de registro DNS
-      #   tipo A próprio, apontando para o mesmo IP público da VM.
+      # ↑ Domínio público do Vaultwarden — mesmo raciocínio: o DNS aponta
+      #   para o IP público do Nginx da borda, não para o desta VM.
 
       http:
         paths:
@@ -130,13 +113,13 @@ spec:
 
 # ==============================================================================
 # PRÓXIMOS PASSOS RECOMENDADOS (fora do escopo deste arquivo — ver README.md):
-#   1. Configurar 2 registros DNS tipo A na zona "rondonopolis.mt.gov.br":
-#        sso.rondonopolis.mt.gov.br    -> IP público da VM
-#        cofre.rondonopolis.mt.gov.br  -> IP público da VM
-#      (Precisam estar resolvendo corretamente ANTES do cert-manager tentar
-#      emitir o certificado, pois o desafio HTTP-01 valida via DNS+HTTP real.)
-#   2. Abrir/mapear apenas as portas 80 e 443 no firewall/roteador da VM
-#      (NUNCA a porta do SSH/Kubernetes API para a internet).
-#   3. Instalar o cert-manager e aplicar o ClusterIssuer — passo a passo
-#      completo na seção "Bootstrap único do cluster" do README.md.
+#   1. Aplicar k3s-cluster/traefik-trusted-headers.yaml com o IP real do seu
+#      Nginx da borda (ESSENCIAL — sem isso, o Keycloak vai gerar links
+#      "http://" em vez de "https://" e o login pode quebrar em loop de
+#      redirecionamento).
+#   2. Copiar a configuração de exemplo em nginx-edge/ para dentro da
+#      configuração já existente do seu Nginx, ajustando o IP interno desta
+#      VM e os caminhos dos certificados TLS que o Nginx já gerencia.
+#   3. Confirmar que o Nginx da borda consegue alcançar esta VM na porta 80
+#      (mesma rede interna/VLAN, ou rota configurada entre os segmentos).
 # ==============================================================================

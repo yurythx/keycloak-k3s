@@ -9,13 +9,13 @@ nunca expor SSH ou a API do Kubernetes para a internet.
 | **Keycloak 26 (Quarkus)** | Identity Provider (SSO, OIDC/SAML) para os sistemas da prefeitura | 2 (alta disponibilidade) | `sso.rondonopolis.mt.gov.br` |
 | **PostgreSQL 16-alpine** | Banco de dados persistente do Keycloak | 1 | (interno, sem acesso externo) |
 | **Vaultwarden** | Cofre de senhas (compatível com Bitwarden) para as equipes de TI/administração | 1 | `cofre.rondonopolis.mt.gov.br` |
-| **Traefik** | Ingress Controller (já incluso no K3s) — expõe os domínios públicos | — | — |
-| **cert-manager** | Emite/renova certificados HTTPS válidos automaticamente (Let's Encrypt) | — | — |
+| **Traefik** | Ingress Controller (já incluso no K3s) — roteia por domínio dentro do cluster | — | — |
+| **Nginx (fora do K3s)** | Servidor de borda **já existente** na rede da prefeitura — termina o HTTPS público e repassa para o Traefik | — | recebe os 2 domínios acima |
 
 Este repositório já está **100% pronto para ser aplicado na VM assim que
 ela existir** — os domínios reais, o RBAC de clustering, o backup
-automático, a segmentação de rede e o HTTPS válido já estão todos
-configurados nos manifestos. O que falta é só a parte física (seção 4).
+automático e a segmentação de rede já estão todos configurados nos
+manifestos. O que falta é só a parte física (seção 4).
 
 ---
 
@@ -24,45 +24,62 @@ configurados nos manifestos. O que falta é só a parte física (seção 4).
 ```
                          Internet
                             │
-                            │  Portas 80/443 (únicas abertas no firewall)
+                            │  Portas 80/443 (o Nginx da borda já cuida disso)
                             ▼
-                  ┌───────────────────┐
-                  │   Traefik (K3s)   │  ← Ingress Controller nativo do K3s
-                  └─────────┬─────────┘
-                            │  roteamento por domínio (Host header)
-                            │  TLS emitido pelo cert-manager (Let's Encrypt)
-              ┌─────────────┴─────────────┐
-              ▼                           ▼
- sso.rondonopolis.mt.gov.br    cofre.rondonopolis.mt.gov.br
-              │                           │
-   ┌──────────▼──────────┐     ┌──────────▼──────────┐
-   │  Service: keycloak   │     │ Service: vaultwarden │
-   └──────────┬──────────┘     └──────────┬──────────┘
-              │ 2 réplicas                 │ 1 réplica
-   ┌──────────▼──────────┐     ┌──────────▼──────────┐
-   │  Pod keycloak-1      │     │  Pod vaultwarden     │
-   │  Pod keycloak-2      │     │  (PVC dedicado 5Gi)  │
-   │  (cache HA/KUBE_PING)│     └──────────────────────┘
+                  ┌─────────────────────┐
+                  │  Nginx (borda, já    │  ← Servidor JÁ EXISTENTE na rede da
+                  │  existe na rede)     │    prefeitura. Termina o HTTPS real
+                  │  TERMINA o TLS       │    (guarda o certificado) e decide
+                  └──────────┬──────────┘    "pra qual VM/serviço mandar".
+                             │  HTTP puro (porta 80), com cabeçalhos
+                             │  X-Forwarded-Proto/Host/For
+                             ▼           (mesma VM, mesma porta — o Traefik
+                  ┌─────────────────────┐  quem separa por domínio)
+                  │   Traefik (K3s)      │
+                  └─────────┬───────────┘
+                             │  roteamento por domínio (Host header)
+              ┌──────────────┴─────────────┐
+              ▼                            ▼
+ sso.rondonopolis.mt.gov.br     cofre.rondonopolis.mt.gov.br
+              │                            │
+   ┌──────────▼──────────┐      ┌──────────▼──────────┐
+   │  Service: keycloak    │      │ Service: vaultwarden │
+   └──────────┬──────────┘      └──────────┬──────────┘
+              │ 2 réplicas                  │ 1 réplica
+   ┌──────────▼──────────┐      ┌──────────▼──────────┐
+   │  Pod keycloak-1       │      │  Pod vaultwarden     │
+   │  Pod keycloak-2       │      │  (PVC dedicado 5Gi)  │
+   │  (cache HA/KUBE_PING) │      └──────────────────────┘
    └──────────┬──────────┘
               │  🔒 NetworkPolicy: só o Keycloak acessa a porta 5432
    ┌──────────▼──────────┐
-   │  Service: postgres   │
+   │  Service: postgres    │
    └──────────┬──────────┘
-   ┌──────────▼──────────┐        ┌────────────────────────┐
-   │  Pod postgres         │◄─────┤ CronJob: backup diário  │
-   │  (PVC dedicado 10Gi)  │      │ (pg_dump 03h, PVC 5Gi,  │
-   └──────────────────────┘      │  retenção de 7 dias)    │
-                                  └────────────────────────┘
+   ┌──────────▼──────────┐         ┌────────────────────────┐
+   │  Pod postgres          │◄─────┤ CronJob: backup diário  │
+   │  (PVC dedicado 10Gi)   │      │ (pg_dump 03h, PVC 5Gi,  │
+   └──────────────────────┘       │  retenção de 7 dias)    │
+                                   └────────────────────────┘
 ```
+
+**Por que o HTTPS termina no Nginx, e não no Traefik/K3s:** a rede da
+prefeitura já tem um servidor Nginx isolado dedicado a receber requisições
+públicas e direcioná-las para o backend correto — reaproveitamos essa peça
+já existente em vez de duplicar a responsabilidade dentro do cluster. Isso
+significa que **esta VM do K3s não precisa de nenhum IP público nem porta
+aberta para a internet** — só precisa ser alcançável pelo Nginx na rede
+interna, na porta 80. Detalhes técnicos completos (e o porquê de cada
+cabeçalho HTTP importar) estão comentados em `k3s-cluster/ingress.yaml`,
+`k3s-cluster/traefik-trusted-headers.yaml` e `nginx-edge/`.
 
 **Namespace único:** todos os recursos vivem dentro de `authentication`,
 isolados do resto do cluster.
 
 **Segurança de rede:** o Self-Hosted Runner do GitHub Actions roda DENTRO
 da VM e abre uma conexão de **saída** para buscar trabalho na GitHub —
-**nenhuma porta de entrada** (SSH, API do Kubernetes) precisa ficar exposta
-publicamente. Só as portas **80 e 443** (tráfego web do Traefik) precisam
-estar abertas no firewall/roteador.
+nenhuma porta de entrada (SSH, API do Kubernetes) precisa ficar exposta.
+Com o Nginx de borda cuidando do tráfego público, esta VM nem precisa ser
+alcançável diretamente da internet — só pelo Nginx, na rede interna.
 
 **Persistência:** PostgreSQL, Vaultwarden e os backups gravam em
 **PersistentVolumeClaims** usando a StorageClass `local-path` (já embutida
@@ -80,10 +97,6 @@ Rondonópolis-MT), compacta o resultado e mantém os últimos 7 dias
 automaticamente, em um disco separado do disco de dados (ver limitação
 sobre backup off-site em `k3s-cluster/postgres-backup-cronjob.yaml`).
 
-**HTTPS válido:** o `cert-manager` (instalado uma única vez, manualmente —
-seção 4.2) emite e renova sozinho os certificados Let's Encrypt para os
-dois domínios, sem certificado autoassinado nem alerta no navegador.
-
 ---
 
 ## 2. Consumo de memória (por que cabe em 8GB de RAM)
@@ -95,12 +108,14 @@ dois domínios, sem certificado autoassinado nem alerta no navegador.
 | Keycloak (× 2 réplicas) | 600Mi cada (1200Mi total) | 1024Mi cada (2048Mi total) |
 | Vaultwarden | 64Mi | 128Mi |
 | Backup CronJob (só durante a execução diária, ~1 min/dia) | 64Mi | 256Mi |
-| Traefik + cert-manager (já incluso/instalado no K3s) | ~150Mi | — |
-| **Total aproximado no pior caso (limits)** | | **~3,7 GiB** |
+| Traefik (já incluso no K3s) | ~50Mi | — |
+| **Total aproximado no pior caso (limits)** | | **~3,5 GiB** |
 
 Isso deixa **mais de 4GB de RAM livres** na VM de 8GB para picos de tráfego,
 cache de disco do sistema operacional e crescimento futuro — uma margem de
 segurança confortável para não sofrer com OOM (Out of Memory) em produção.
+Como o HTTPS é terminado no Nginx da borda (fora desta VM), não rodamos
+cert-manager dentro do cluster — uma peça a menos disputando RAM.
 
 > 💡 Todos os limites de CPU/RAM estão declarados nos próprios manifestos
 > (`resources.requests` / `resources.limits`), comentados linha a linha —
@@ -117,17 +132,21 @@ keycloak-k3s/
 │   └── workflows/
 │       └── deploy.yml                   # Pipeline GitOps (self-hosted runner, 14 passos)
 ├── scripts/
-│   └── bootstrap-vm.sh                  # Script único: K3s + cert-manager + kubectl + runner
+│   └── bootstrap-vm.sh                  # Script único: K3s + kubectl + runner
+├── nginx-edge/                          # Referência p/ colar no Nginx da borda (não roda no K3s)
+│   ├── README.md
+│   ├── sso.rondonopolis.mt.gov.br.conf
+│   └── cofre.rondonopolis.mt.gov.br.conf
 ├── k3s-cluster/
 │   ├── namespaces.yaml                  # Namespace "authentication"
 │   ├── secrets.yaml                     # Credenciais (Postgres, Keycloak, Vaultwarden)
+│   ├── traefik-trusted-headers.yaml     # Traefik confia no X-Forwarded-* do Nginx
 │   ├── postgres-db.yaml                 # PVC + Deployment + Service do PostgreSQL
 │   ├── keycloak.yaml                    # RBAC + Deployment (2 réplicas) + Service
 │   ├── vaultwarden.yaml                 # PVC + Deployment + Service do Vaultwarden
 │   ├── network-policy.yaml              # Restringe acesso ao Postgres só ao Keycloak
 │   ├── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
-│   ├── cert-manager-issuer.yaml         # ClusterIssuer Let's Encrypt (HTTPS válido)
-│   └── ingress.yaml                     # Roteamento Traefik (domínios públicos + TLS)
+│   └── ingress.yaml                     # Roteamento Traefik (domínios -> Services)
 └── README.md                            # Este arquivo
 ```
 
@@ -137,24 +156,24 @@ keycloak-k3s/
 
 ### 4.1. Pré-requisitos
 
-- VM Bare Metal (ou dedicada) com **Linux** (Ubuntu Server 22.04/24.04
+- VM Bare Metal/Proxmox com **Linux** (Ubuntu Server 22.04/24.04
   recomendado), **8GB de RAM**, acesso root/sudo.
+- Conectividade de rede entre esta VM e o servidor **Nginx da borda**
+  (mesma VLAN/sub-rede, ou rota configurada entre elas) — a VM só precisa
+  aceitar conexões do Nginx na porta 80, nada mais.
 - Os domínios `sso.rondonopolis.mt.gov.br` e `cofre.rondonopolis.mt.gov.br`
   já criados na zona DNS `rondonopolis.mt.gov.br`, prontos para apontar
-  para o IP público da VM (você faz isso na seção 4.6, depois de saber o
-  IP definitivo).
-- Firewall/roteador com capacidade de liberar **apenas** as portas
-  **80 e 443** de entrada para o IP público da VM.
+  para o **IP público do Nginx da borda** (não desta VM).
 
 ### 4.2. Opção A (recomendada): script único de bootstrap automatizado
 
-Em vez de digitar os comandos das seções 4.3 a 4.5 um por um, o script
+Em vez de digitar os comandos das seções 4.3 a 4.4 um por um, o script
 [`scripts/bootstrap-vm.sh`](scripts/bootstrap-vm.sh) faz tudo de uma vez:
-instala o K3s, instala o cert-manager, configura o `kubectl` para o seu
-usuário e — se você fornecer um token do GitHub — registra e inicia o
-Self-Hosted Runner. É **idempotente**: rodar de novo depois não quebra nada
-(cada etapa verifica se já foi feita antes de agir), então também serve
-para "consertar" uma VM que ficou pela metade.
+instala o K3s, configura o `kubectl` para o seu usuário e — se você
+fornecer um token do GitHub — registra e inicia o Self-Hosted Runner. É
+**idempotente**: rodar de novo depois não quebra nada (cada etapa verifica
+se já foi feita antes de agir), então também serve para "consertar" uma VM
+que ficou pela metade.
 
 ```bash
 # Dentro da VM, clone o repositório (ou copie só este script via scp):
@@ -173,7 +192,8 @@ sudo GH_PAT="ghp_xxx_seu_token" ./scripts/bootstrap-vm.sh
 ```
 
 O script imprime, ao final, exatamente o que ainda falta fazer fora dele
-(editar segredos, DNS, port-forward) — pule direto para a seção 4.6.
+(editar segredos, IP do Nginx, config do Nginx, DNS) — pule direto para a
+seção 4.6.
 
 > O token (`GH_PAT`) só é usado em memória, na hora de chamar a API do
 > GitHub para pegar um token de registro temporário (válido ~1h) — nunca é
@@ -184,13 +204,13 @@ Se preferir entender/rodar cada comando manualmente (ou se algo no script
 falhar e você precisar diagnosticar um passo específico), siga a **Opção B**
 abaixo — é exatamente o que o script automatiza por baixo dos panos.
 
-### 4.3. Opção B: instalar o K3s + cert-manager manualmente
+### 4.3. Opção B: instalar o K3s manualmente
 
 Conecte-se na VM (localmente ou via um acesso já existente) e rode:
 
 ```bash
-# 1) Instala o K3s como um único binário, já com Traefik e o
-#    local-path-provisioner (storage) inclusos por padrão.
+# Instala o K3s como um único binário, já com Traefik e o
+# local-path-provisioner (storage) inclusos por padrão.
 curl -sfL https://get.k3s.io | sh -s - \
   --write-kubeconfig-mode 644
   # ↑ Deixa o arquivo de credenciais do cluster (kubeconfig) legível pelo
@@ -202,23 +222,10 @@ sudo k3s kubectl get nodes
 # ↑ Deve mostrar 1 nó em status "Ready".
 ```
 
-```bash
-# 2) Instala o cert-manager (peça de infraestrutura, instalada uma única
-#    vez — não faz parte do GitOps desta aplicação, assim como o próprio
-#    K3s). Ele registra as CRDs (ClusterIssuer, Certificate) usadas por
-#    k3s-cluster/cert-manager-issuer.yaml.
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-
-# Aguarde os Pods do cert-manager ficarem prontos (leva ~1 minuto):
-kubectl get pods -n cert-manager -w
-# ↑ Pressione Ctrl+C quando os 3 Pods (cert-manager, cainjector, webhook)
-#   estiverem "Running" e "1/1 Ready".
-```
-
 > ℹ️ O instalador do K3s já vem com o **Traefik** (Ingress Controller) e o
 > **Local Path Provisioner** (StorageClass `local-path`) habilitados por
-> padrão — não é preciso instalar nada extra além do cert-manager acima
-> para este projeto funcionar.
+> padrão — não é preciso instalar nada extra para este projeto funcionar
+> (o HTTPS público fica por conta do Nginx da borda, já existente).
 
 > ⚠️ **Sobre a NetworkPolicy (`network-policy.yaml`):** o K3s usa Flannel
 > como CNI padrão, que **não enforça** NetworkPolicies (o recurso é
@@ -285,53 +292,55 @@ sudo ./svc.sh status
 > porta de entrada no firewall para o runner funcionar. Rode-o com um
 > usuário Linux SEM privilégios de root (o instalador já orienta isso).
 
-### 4.6. Trocar as senhas fictícias (único ajuste de conteúdo pendente)
+### 4.6. Ajustes finais de conteúdo (antes do primeiro deploy)
 
 Os domínios (`sso.rondonopolis.mt.gov.br` e `cofre.rondonopolis.mt.gov.br`)
 já estão configurados em `ingress.yaml`, `keycloak.yaml` e
-`vaultwarden.yaml` — nada a fazer aí. O que ainda precisa de atenção antes
-de ir para produção de verdade:
+`vaultwarden.yaml` — nada a fazer aí. O que ainda precisa de atenção:
 
 1. **Troque todas as senhas fictícias** em `k3s-cluster/secrets.yaml` (veja
    o passo a passo detalhado dentro do próprio arquivo — inclui como gerar
    senhas fortes com `openssl rand -base64 32`).
-2. Edite `k3s-cluster/cert-manager-issuer.yaml` e troque o e-mail
-   `ti@rondonopolis.mt.gov.br` pelo e-mail real da equipe de TI responsável
-   (usado só para avisos administrativos do Let's Encrypt).
-3. Aponte os registros DNS tipo **A** de `sso.rondonopolis.mt.gov.br` e
-   `cofre.rondonopolis.mt.gov.br` para o IP público definitivo da VM.
+2. Edite `k3s-cluster/traefik-trusted-headers.yaml` e troque o IP de
+   exemplo (`10.10.0.50/32`) pelo IP interno real do seu servidor Nginx de
+   borda — **essencial** para o Keycloak reconhecer corretamente que o
+   usuário acessou via HTTPS (sem isso, o login pode entrar em loop de
+   redirecionamento).
+3. Copie os arquivos de `nginx-edge/*.conf` para dentro da configuração já
+   existente do seu Nginx, trocando `SUBSTITUA_PELO_IP_DA_VM_K3S` pelo IP
+   interno real desta VM, e ajustando os caminhos dos certificados TLS
+   (`ssl_certificate`/`ssl_certificate_key`) para os que o Nginx já usa.
+4. Aponte os registros DNS tipo **A** de `sso.rondonopolis.mt.gov.br` e
+   `cofre.rondonopolis.mt.gov.br` para o **IP público do Nginx da borda**
+   (não desta VM).
 
 ### 4.7. Disparar o primeiro deploy
 
 ```bash
 git add .
-git commit -m "Ajusta segredos e e-mail do cert-manager para produção"
+git commit -m "Ajusta segredos e IP do Nginx de borda para producao"
 git push origin main
 ```
 
 Acompanhe a execução em **Actions** no GitHub — o job `aplicar-manifestos`
 vai rodar no seu runner self-hosted e aplicar os manifestos em ordem lógica:
-Namespace → Secrets → PostgreSQL → NetworkPolicy → Backup CronJob →
-Keycloak → Vaultwarden → ClusterIssuer (cert-manager) → Ingress.
-
-> Se o DNS ainda não tiver propagado no momento deste primeiro deploy, o
-> Ingress sobe normalmente (com certificado autoassinado temporário) e o
-> cert-manager fica tentando emitir o certificado válido em segundo plano,
-> sem bloquear o resto da stack — assim que o DNS propagar, ele completa
-> sozinho, sem precisar rodar o workflow de novo.
+Config. do Traefik → Namespace → Secrets → PostgreSQL → NetworkPolicy →
+Backup CronJob → Keycloak → Vaultwarden → Ingress.
 
 ### 4.8. Validar a implantação
 
 ```bash
 kubectl get pods -n authentication -o wide
 kubectl get ingress -n authentication
-kubectl get certificate -n authentication
-# ↑ Deve mostrar "auth-stack-tls-cert" com READY=True após alguns minutos.
+
+# Direto da VM (ou de dentro da rede), simula o que o Nginx vai enviar:
+curl -H "Host: sso.rondonopolis.mt.gov.br" http://localhost/
 ```
 
-Acesse `https://sso.rondonopolis.mt.gov.br` (deve mostrar a tela do
+Depois de configurar e recarregar o Nginx da borda (seção 4.6, item 3),
+acesse `https://sso.rondonopolis.mt.gov.br` (deve mostrar a tela do
 Keycloak) e `https://cofre.rondonopolis.mt.gov.br` (deve mostrar a tela do
-Vaultwarden), ambos com cadeado válido no navegador.
+Vaultwarden), ambos com o certificado válido que o Nginx já gerencia.
 
 ---
 
@@ -345,7 +354,7 @@ Vaultwarden), ambos com cadeado válido no navegador.
 | Ver backups disponíveis | `kubectl run -n authentication ls-backups --rm -it --image=busybox --restart=Never --overrides='{"spec":{"containers":[{"name":"ls-backups","image":"busybox","command":["ls","-lh","/backups"],"volumeMounts":[{"name":"b","mountPath":"/backups"}]}],"volumes":[{"name":"b","persistentVolumeClaim":{"claimName":"postgres-backup-pvc"}}]}}'` |
 | Forçar um backup fora do horário agendado | `kubectl create job -n authentication backup-manual --from=cronjob/postgres-backup` |
 | Ver uso de RAM/CPU real dos Pods | `kubectl top pods -n authentication` |
-| Ver status do certificado HTTPS | `kubectl describe certificate auth-stack-tls-cert -n authentication` |
+| Testar o roteamento sem depender do Nginx | `curl -H "Host: sso.rondonopolis.mt.gov.br" http://IP_DA_VM/` |
 | Forçar reaplicação dos manifestos | Aba **Actions** → workflow **Deploy Auth Stack para o K3s** → **Run workflow** |
 
 ---
@@ -362,9 +371,12 @@ Vaultwarden), ambos com cadeado válido no navegador.
 - **CNI com enforcement de NetworkPolicy** (ex.: Calico), caso a
   segmentação de rede precise ser efetivamente bloqueante e não apenas
   declarativa — ver aviso em `network-policy.yaml`.
+- **Monitorar a validade do certificado** gerenciado pelo Nginx da borda
+  (fora do escopo deste repositório, mas crítico — um certificado vencido
+  ali derruba o HTTPS de toda a stack).
 
 ---
 
-**Dúvidas ou problemas?** Cada arquivo `.yaml` deste repositório tem
-comentários explicando linha a linha o que cada parâmetro faz — comece por
-lá antes de alterar qualquer valor.
+**Dúvidas ou problemas?** Cada arquivo `.yaml`/`.sh`/`.conf` deste
+repositório tem comentários explicando linha a linha o que cada parâmetro
+faz — comece por lá antes de alterar qualquer valor.

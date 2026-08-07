@@ -1,0 +1,100 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/traefik-trusted-headers.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Configurar o Traefik (já embutido no K3s) para CONFIAR nos cabeçalhos
+#   `X-Forwarded-*` enviados pelo Nginx da borda da rede da prefeitura, em
+#   vez de sobrescrevê-los com os próprios valores.
+#
+# ⚠️ POR QUE ISSO É CRÍTICO NESTA ARQUITETURA — LEIA COM ATENÇÃO
+#   Cadeia de proxies desta instalação:
+#
+#     Usuário (HTTPS) -> Nginx da borda (termina TLS) -> Traefik (HTTP) -> Keycloak/Vaultwarden
+#
+#   O Nginx da borda envia `X-Forwarded-Proto: https` (avisando "a
+#   requisição original do usuário foi HTTPS, mesmo que eu esteja te
+#   mandando ela em HTTP puro agora"). O Keycloak precisa dessa informação
+#   para: gerar corretamente os links de redirect/callback do OIDC, marcar
+#   cookies de sessão como "Secure", e evitar loops de redirecionamento
+#   entre HTTP e HTTPS.
+#
+#   O PROBLEMA: por padrão, o Traefik NÃO confia em cabeçalhos
+#   X-Forwarded-* vindos de qualquer origem (medida de segurança — senão
+#   qualquer cliente poderia forjar `X-Forwarded-Proto: https` e enganar a
+#   aplicação por trás). Por padrão, o Traefik SOBRESCREVE esses
+#   cabeçalhos com o que ELE PRÓPRIO observou na conexão — e como o Nginx
+#   fala HTTP puro com o Traefik, o Traefik "acha" que a requisição sempre
+#   foi HTTP, e o Keycloak (mesmo com `KC_PROXY_HEADERS=xforwarded`
+#   configurado) recebe a informação ERRADA.
+#
+#   A SOLUÇÃO: dizer explicitamente ao Traefik "os cabeçalhos X-Forwarded-*
+#   que vierem do IP do Nginx da borda são confiáveis — repasse-os para
+#   frente sem alterar". É isso que este arquivo faz.
+#
+# COMO FUNCIONA (HelmChartConfig)
+#   O K3s instala o Traefik automaticamente via um recurso `HelmChart`
+#   interno (gerenciado pelo próprio K3s, não por nós). Para customizar os
+#   valores desse Helm chart sem "brigar" com o K3s a cada reinicialização,
+#   o método OFICIAL é criar um `HelmChartConfig` com o MESMO NOME
+#   ("traefik") no MESMO NAMESPACE ("kube-system") — o K3s mescla
+#   automaticamente o conteúdo deste arquivo com a configuração padrão dele
+#   sempre que o Traefik for (re)instalado/atualizado.
+#   Documentação oficial: https://docs.k3s.io/helm#customizing-packaged-components-with-helmchartconfig
+# ==============================================================================
+
+apiVersion: helm.cattle.io/v1
+# ↑ Grupo de API específico do K3s/Rancher para customizar HelmCharts
+#   embutidos (não existe em um Kubernetes "genérico" — é uma extensão do K3s).
+
+kind: HelmChartConfig
+# ↑ Diferente de "HelmChart" (que INSTALA um chart), "HelmChartConfig"
+#   apenas COMPLEMENTA/sobrescreve valores de um HelmChart que o K3s já
+#   gerencia internamente — não cria uma instalação nova do Traefik.
+
+metadata:
+  name: traefik
+  # ↑ TEM que ser exatamente "traefik" — é assim que o K3s identifica a
+  #   qual HelmChart interno esta configuração se aplica.
+  namespace: kube-system
+  # ↑ TEM que ser exatamente "kube-system" — é onde o K3s instala o
+  #   Traefik internamente.
+
+spec:
+  valuesContent: |-
+    # ↑ Bloco de texto (YAML dentro de YAML) com os valores do Helm chart
+    #   oficial do Traefik que queremos sobrescrever/adicionar.
+
+    additionalArguments:
+      - "--entrypoints.web.forwardedHeaders.trustedIPs=10.10.0.50/32"
+      # ↑ ⚠️ TROQUE "10.10.0.50" PELO IP REAL DO SEU NGINX DA BORDA NA
+      #   REDE INTERNA (o IP que a VM do K3s enxerga como origem da
+      #   conexão vinda do Nginx — normalmente o IP dele na mesma
+      #   VLAN/sub-rede da VM). Pode ser uma lista, separada por vírgula,
+      #   se houver mais de um Nginx/IP de origem, ex.:
+      #   "--entrypoints.web.forwardedHeaders.trustedIPs=10.10.0.50/32,10.10.0.51/32"
+      #
+      #   Se preferir liberar por toda uma sub-rede em vez de um IP único
+      #   (ex.: toda a VLAN de servidores de borda), use a notação CIDR,
+      #   ex.: "10.10.0.0/24".
+      #
+      #   Com este IP configurado, o Traefik passa a CONFIAR e REPASSAR os
+      #   cabeçalhos X-Forwarded-Proto/X-Forwarded-For/X-Forwarded-Host que
+      #   chegarem de conexões originadas exatamente deste IP — conexões de
+      #   qualquer outra origem continuam tendo esses cabeçalhos
+      #   sobrescritos (comportamento seguro padrão preservado para o resto
+      #   do mundo).
+
+# ==============================================================================
+# COMO DESCOBRIR O IP CORRETO A COLOCAR ACIMA:
+#   No servidor Nginx da borda, rode: hostname -I  (ou veja a config de rede)
+#   — use o IP que ele usa na MESMA rede/VLAN da VM do K3s (não o IP
+#   público dele voltado para a internet).
+#
+# COMO VALIDAR SE FUNCIONOU (depois de aplicado + Nginx configurado):
+#   No Keycloak, acesse https://sso.rondonopolis.mt.gov.br e confira se o
+#   login completa sem erro de "redirect_uri" ou loop de redirecionamento.
+#   Também é possível inspecionar os cabeçalhos recebidos com:
+#     kubectl exec -n authentication deploy/keycloak -- \
+#       curl -s -H "Host: sso.rondonopolis.mt.gov.br" \
+#       -H "X-Forwarded-Proto: https" http://localhost:8080/ -D - -o /dev/null
+# ==============================================================================
