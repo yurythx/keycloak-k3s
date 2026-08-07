@@ -78,8 +78,16 @@ RUNNER_NAME="${RUNNER_NAME:-$(hostname)-k3s}"
 # ↑ Nome de exibição do runner na interface do GitHub. Por padrão, usa o
 #   hostname da VM + sufixo "-k3s" para ficar fácil de identificar.
 
-RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner}"
-# ↑ Pasta onde o agente do runner será instalado.
+RUNNER_DIR="${RUNNER_DIR:-}"
+# ↑ Pasta onde o agente do runner será instalado. Deixado vazio aqui de
+#   propósito — o valor padrão é calculado MAIS ABAIXO, depois de
+#   descobrirmos TARGET_HOME (ver bloco "Verificações iniciais"). Se
+#   calculássemos aqui usando "$HOME/actions-runner", o resultado seria
+#   ERRADO ao rodar via `sudo`: o sudo troca $HOME para o home do ROOT
+#   (/root) antes mesmo do script começar a rodar — então "$HOME" neste
+#   ponto do arquivo NÃO é o home do usuário que chamou o sudo, é o do
+#   root. Isso causava o runner tentar instalar em /root/actions-runner
+#   (sem permissão) em vez de /home/<usuario>/actions-runner.
 
 GH_PAT="${GH_PAT:-}"
 # ↑ Personal Access Token opcional — se vazio, o passo 3 (runner) é pulado
@@ -117,6 +125,11 @@ if [[ -z "${TARGET_HOME}" ]]; then
   TARGET_HOME="/root"
 fi
 log_info "Usuário alvo para kubeconfig/runner: ${TARGET_USER} (HOME=${TARGET_HOME})"
+
+RUNNER_DIR="${RUNNER_DIR:-${TARGET_HOME}/actions-runner}"
+# ↑ Só agora calculamos o padrão (se RUNNER_DIR não veio definido por
+#   variável de ambiente), já usando o TARGET_HOME correto — ver
+#   explicação detalhada onde RUNNER_DIR é declarado acima.
 
 # Garante que temos as ferramentas básicas usadas neste script.
 if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
