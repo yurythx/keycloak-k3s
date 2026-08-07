@@ -49,7 +49,7 @@ manifestos. O que falta é só a parte física (seção 4).
    ┌──────────▼──────────┐      ┌──────────▼──────────┐
    │  Pod keycloak-1       │      │  Pod vaultwarden     │
    │  Pod keycloak-2       │      │  (PVC dedicado 5Gi)  │
-   │  (cache HA/KUBE_PING) │      └──────────────────────┘
+   │  (cache ispn/DNS_PING)│      └──────────────────────┘
    └──────────┬──────────┘
               │  🔒 NetworkPolicy: só o Keycloak acessa a porta 5432
    ┌──────────▼──────────┐

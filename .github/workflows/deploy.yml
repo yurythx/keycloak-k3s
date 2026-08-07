@@ -169,12 +169,11 @@ jobs:
         #   Secret (passo 5) para as credenciais de conexão, e é
         #   independente do Keycloak/Vaultwarden em si.
 
-      - name: 10. Aplicar Keycloak (RBAC + Deployment + Service)
+      - name: 10. Aplicar Keycloak (Service headless + Deployment + Service)
         run: kubectl apply -f k3s-cluster/keycloak.yaml
-        # ↑ Cria a ServiceAccount/Role/RoleBinding (necessárias para o
-        #   clustering via KUBE_PING) e o Deployment com as 2 réplicas do
-        #   Keycloak, já apontando para o Postgres (que garantimos estar
-        #   pronto no passo 7).
+        # ↑ Cria o Service headless (usado pelo DNS_PING para o clustering
+        #   entre as 2 réplicas) e o Deployment do Keycloak, já apontando
+        #   para o Postgres (que garantimos estar pronto no passo 7).
 
       - name: 11. Aplicar Vaultwarden (PVC + Deployment + Service)
         run: kubectl apply -f k3s-cluster/vaultwarden.yaml

@@ -7,84 +7,66 @@
 #   outro continua atendendo login da prefeitura sem interrupção.
 #
 # RECURSOS DECLARADOS NESTE ARQUIVO (em ordem lógica):
-#   1. ServiceAccount + Role + RoleBinding -> permissão mínima necessária
-#      para os Pods do Keycloak se "enxergarem" entre si via API do
-#      Kubernetes (necessário para clustering/sessões compartilhadas).
+#   1. Service headless -> dá a cada Pod do Keycloak um registro DNS
+#      individual, usado pelo protocolo de clustering (ver abaixo).
 #   2. Deployment (2 réplicas) -> os Pods do Keycloak propriamente ditos.
 #   3. Service (ClusterIP)     -> endereço de rede interno usado pelo Ingress.
 #
-# POR QUE PRECISAMOS DE RBAC (ServiceAccount/Role/RoleBinding) AQUI?
+# COMO FUNCIONA O CLUSTERING (histórico de um erro real corrigido aqui)
 #   Com 2 réplicas, cada Pod do Keycloak precisa saber da EXISTÊNCIA do outro
 #   para sincronizar cache distribuído (sessões de login, tokens revogados,
-#   etc.) via Infinispan/JGroups. O protocolo de descoberta "KUBE_PING"
-#   (usado quando KC_CACHE_STACK=kubernetes) faz isso perguntando à API do
-#   Kubernetes "quais Pods existem com o rótulo app=keycloak?" — para isso,
-#   o Pod precisa de permissão de LEITURA (get/list/watch) sobre Pods no
-#   namespace. Sem essa permissão, cada réplica ficaria "isolada" e um
-#   usuário logado no Pod A seria deslogado ao cair no Pod B.
+#   etc.) via Infinispan/JGroups. A primeira versão deste arquivo assumia
+#   que `KC_CACHE_STACK=kubernetes` usava o protocolo "KUBE_PING" (consulta
+#   à API do Kubernetes) e criava um ServiceAccount+Role+RoleBinding para
+#   isso — ERRADO: na prática (confirmado rodando de verdade e vendo o
+#   Pod crashar com "dns_query can not be null or empty"), o stack
+#   "kubernetes" do Keycloak 26 usa **DNS_PING**, que descobre os outros
+#   Pods via consulta DNS a um Service HEADLESS (`clusterIP: None`), não
+#   via API do Kubernetes. Por isso este arquivo NÃO tem mais RBAC nenhum
+#   (não precisa) — em vez disso, tem o Service headless abaixo, e a
+#   variável JAVA_OPTS_APPEND (mais adiante) apontando o DNS_PING para ele.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1a) ServiceAccount — a "identidade" que os Pods do Keycloak usam para
-#     conversar com a API do Kubernetes
+# 1) Service headless — dá um registro DNS individual a cada Pod do Keycloak
 # ------------------------------------------------------------------------------
 apiVersion: v1
-kind: ServiceAccount
+kind: Service
 metadata:
-  name: keycloak-sa
-  # ↑ Nome da identidade de serviço. Referenciado em `spec.serviceAccountName`
-  #   do Deployment, mais abaixo.
+  name: keycloak-headless
   namespace: authentication
+  labels:
+    app: keycloak
 
----
-# ------------------------------------------------------------------------------
-# 1b) Role — o "conjunto de permissões" (o que a identidade acima PODE fazer)
-# ------------------------------------------------------------------------------
-apiVersion: rbac.authorization.k8s.io/v1
-# ↑ Grupo de API responsável por controle de acesso baseado em papéis (RBAC).
+spec:
+  clusterIP: None
+  # ↑ Isso é o que torna este Service "headless": em vez de um único IP
+  #   virtual (ClusterIP normal), uma consulta DNS a este nome retorna
+  #   DIRETAMENTE os IPs de TODOS os Pods que casarem com o selector
+  #   abaixo — exatamente o que o protocolo DNS_PING do JGroups precisa
+  #   para descobrir os outros Pods do Keycloak e formar o cluster.
 
-kind: Role
-# ↑ "Role" (diferente de "ClusterRole") concede permissões APENAS dentro de
-#   um namespace específico — aplicando o Princípio do Menor Privilégio: o
-#   Keycloak não precisa (e não deve) enxergar Pods de outros namespaces.
+  publishNotReadyAddresses: true
+  # ↑ Por padrão, um Service só inclui no DNS os Pods que já estão
+  #   "Ready" — mas os Pods do Keycloak só ficam Ready DEPOIS de formar o
+  #   cluster (que depende desta consulta DNS funcionar). Sem esta opção,
+  #   teríamos um impasse: o 2º Pod nunca encontraria o 1º via DNS
+  #   enquanto o 1º não estivesse Ready, e o 1º não fica Ready sem
+  #   primeiro tentar formar o cluster. `publishNotReadyAddresses: true`
+  #   quebra esse ciclo, publicando o IP do Pod no DNS assim que ele
+  #   existe, independente do estado das probes.
 
-metadata:
-  name: keycloak-pod-reader
-  namespace: authentication
+  selector:
+    app: keycloak
+    # ↑ Mesmo rótulo usado pelo Deployment abaixo — este Service enxerga
+    #   as 2 réplicas do Keycloak (e só elas).
 
-rules:
-  - apiGroups: [""]
-    # ↑ "" (string vazia) representa o grupo de API "core" — onde vive o
-    #   recurso "pods".
-    resources: ["pods"]
-    # ↑ Esta permissão vale apenas para o tipo de recurso "Pods".
-    verbs: ["get", "list", "watch"]
-    # ↑ Apenas verbos de LEITURA: consultar um Pod específico (get), listar
-    #   todos (list) e observar mudanças em tempo real (watch). NÃO incluímos
-    #   "create", "delete" ou "update" — o Keycloak jamais precisa alterar
-    #   Pods, apenas descobrir seus IPs para formar o cluster.
-
----
-# ------------------------------------------------------------------------------
-# 1c) RoleBinding — "conecta" a ServiceAccount à Role (quem recebe a permissão)
-# ------------------------------------------------------------------------------
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: keycloak-pod-reader-binding
-  namespace: authentication
-
-subjects:
-  - kind: ServiceAccount
-    name: keycloak-sa
-    # ↑ A quem estamos concedendo a permissão: a ServiceAccount criada acima.
-    namespace: authentication
-
-roleRef:
-  kind: Role
-  name: keycloak-pod-reader
-  # ↑ Qual conjunto de permissões está sendo concedido: a Role definida acima.
-  apiGroup: rbac.authorization.k8s.io
+  ports:
+    - name: jgroups
+      port: 7800
+      # ↑ Porta usada pelo JGroups (TCP) para a comunicação REAL entre os
+      #   Pods depois de se descobrirem via DNS — não precisa ser exposta
+      #   para fora do cluster, só entre os próprios Pods do Keycloak.
 
 ---
 # ------------------------------------------------------------------------------
@@ -124,16 +106,12 @@ spec:
     metadata:
       labels:
         app: keycloak
-        # ↑ Este rótulo é usado por: (a) o Service abaixo, para rotear
-        #   tráfego, e (b) o próprio Keycloak via KUBE_PING, para achar seus
-        #   Pods "irmãos" e formar o cluster de cache distribuído.
+        # ↑ Este rótulo é usado por: (a) o Service ClusterIP normal (para
+        #   o Ingress rotear tráfego), (b) o Service headless da seção 1
+        #   (para o DNS_PING descobrir os Pods "irmãos" e formar o cluster
+        #   de cache distribuído).
 
     spec:
-      serviceAccountName: keycloak-sa
-      # ↑ Faz os Pods usarem a identidade/permissões criadas na seção 1
-      #   acima, em vez da ServiceAccount "default" (que não tem permissão
-      #   nenhuma) — necessário para o KUBE_PING funcionar.
-
       # "Anti-affinity": tenta espalhar as 2 réplicas em nós diferentes,
       # caso o cluster cresça no futuro. Em um cluster single-node (nosso
       # caso hoje) não tem efeito prático, mas já deixamos preparado.
@@ -337,16 +315,29 @@ spec:
 
             - name: KC_CACHE_STACK
               value: "kubernetes"
-              # ↑ Usa o protocolo de descoberta KUBE_PING (via API do
-              #   Kubernetes, usando a permissão RBAC criada na seção 1) para
-              #   os Pods se encontrarem automaticamente — não exige
-              #   configuração manual de IPs. Não precisamos declarar
-              #   KC_CACHE_CONFIG_FILE: o Keycloak já usa o arquivo padrão
-              #   de cache distribuído (cache-ispn.xml, embutido na imagem)
-              #   automaticamente quando KC_CACHE=ispn — só seria necessário
-              #   apontar um arquivo customizado aqui se, no futuro,
-              #   fôssemos montar uma configuração de cache própria via
-              #   ConfigMap.
+              # ↑ Seleciona o stack JGroups pronto chamado "kubernetes",
+              #   embutido na imagem do Keycloak — mas ele sozinho NÃO
+              #   acha os outros Pods; precisa que a variável
+              #   JAVA_OPTS_APPEND (logo abaixo) informe ONDE procurar via
+              #   DNS. Não precisamos declarar KC_CACHE_CONFIG_FILE: o
+              #   Keycloak já usa o arquivo padrão de cache distribuído
+              #   (cache-ispn.xml, embutido na imagem) automaticamente
+              #   quando KC_CACHE=ispn.
+
+            - name: JAVA_OPTS_APPEND
+              value: "-Djgroups.dns.query=keycloak-headless.authentication.svc.cluster.local"
+              # ↑ ⚠️ PEÇA ESSENCIAL para o clustering funcionar — sem ela, o
+              #   Keycloak crasha na subida com "dns_query can not be null
+              #   or empty". Diferente das variáveis KC_*, esta é lida pelo
+              #   SCRIPT DE ENTRADA do container (não pelo parser de config
+              #   do Keycloak) e repassada como propriedade de sistema Java
+              #   (`-D`) para a JVM. O valor é o nome DNS completo do
+              #   Service HEADLESS criado na seção 1 deste arquivo
+              #   (`keycloak-headless.<namespace>.svc.cluster.local`) — é
+              #   consultando esse nome que o protocolo DNS_PING descobre
+              #   os IPs de todos os Pods do Keycloak e forma o cluster.
+              #   Se algum dia o namespace mudar de nome, esta linha
+              #   também precisa mudar.
 
           resources:
             # ↑ Ajustado para caber confortavelmente em uma VM de 8GB
