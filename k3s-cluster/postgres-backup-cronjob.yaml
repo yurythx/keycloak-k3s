@@ -24,6 +24,32 @@
 #   operacional da VM, ou um job adicional com `rclone`/`restic`) que copie
 #   periodicamente os arquivos de `/backups` para um local OFF-SITE
 #   (outro datacenter, nuvem, bucket S3-compatível, etc.).
+#
+# 🐛 BUG REAL JÁ ENCONTRADO E CORRIGIDO NESTA VERSÃO — HISTÓRICO
+#   Em teste ao vivo no cluster de produção, descobrimos que TODOS os
+#   backups gerados até então eram arquivos .sql.gz de ~20 bytes
+#   (essencialmente vazios), por DOIS motivos combinados:
+#     1. O Pod deste CronJob não tinha nenhum rótulo que o deixasse passar
+#        pela NetworkPolicy `postgres-allow-only-keycloak` — ele estava
+#        sendo BLOQUEADO de conectar no Postgres (ver o rótulo
+#        `app: postgres-backup` adicionado no `template.metadata` abaixo, e
+#        a regra correspondente em network-policy.yaml). Isso já provou, na
+#        prática, que o CNI deste cluster (Flannel no K3s) ESTÁ aplicando
+#        NetworkPolicies de verdade — ver nota corrigida em
+#        network-policy.yaml.
+#     2. O script antigo fazia `pg_dump | gzip -9 > arquivo`, um pipe direto
+#        — e em shell, o código de saída de um pipe é o do ÚLTIMO comando
+#        (`gzip`), não o do `pg_dump`. Resultado: mesmo com `pg_dump`
+#        falhando com "Connection refused", o `gzip` recebia uma entrada
+#        vazia, gerava um .gz "vazio porém 100% válido", saía com sucesso, e
+#        o `set -e` não via erro nenhum — o Job era marcado "Completed" e o
+#        log ainda dizia "Backup concluído" (o tamanho reportado por `du -h`
+#        também enganava, pois arredonda para o tamanho de bloco do disco,
+#        mostrando "4.0K" mesmo para um arquivo de 20 bytes).
+#   A correção abaixo separa `pg_dump` do `gzip` (para que uma falha do
+#   pg_dump interrompa o script de verdade) e adiciona uma verificação
+#   explícita de tamanho mínimo do arquivo gerado, como uma segunda camada
+#   de proteção contra qualquer outra falha silenciosa futura.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -109,6 +135,15 @@ spec:
       #   sem backup.
 
       template:
+        metadata:
+          labels:
+            app: postgres-backup
+            # ↑ CRÍTICO: este rótulo é o que permite que este Pod atravesse
+            #   a NetworkPolicy `postgres-allow-only-keycloak`
+            #   (k3s-cluster/network-policy.yaml). Sem ele, o Pod do backup
+            #   é bloqueado de alcançar o Postgres na porta 5432 — foi
+            #   exatamente isso que aconteceu antes desta correção (ver nota
+            #   no início deste arquivo).
         spec:
           restartPolicy: OnFailure
           # ↑ CronJobs/Jobs não podem usar `Always` — `OnFailure` faz o
@@ -171,17 +206,56 @@ spec:
                   # ↑ Caminho final do backup, já com o carimbo de data/hora
                   #   no nome, para nunca sobrescrever um backup anterior.
 
+                  TMP_SQL="/backups/.tmp_${DATA_HORA}.sql"
+                  # ↑ Arquivo temporário de trabalho — ver explicação abaixo
+                  #   do porquê não fazemos `pg_dump | gzip` diretamente.
+
                   echo "Iniciando backup do banco '${PGDATABASE}' em ${ARQUIVO}..."
 
-                  pg_dump --no-owner --no-privileges | gzip -9 > "${ARQUIVO}"
+                  pg_dump --no-owner --no-privileges > "${TMP_SQL}"
                   # ↑ `pg_dump` gera o dump em formato SQL puro (texto);
                   #   `--no-owner --no-privileges` evita gravar comandos de
                   #   ALTER OWNER/GRANT específicos do usuário atual, o que
-                  #   facilita restaurar em outro ambiente/usuário no
-                  #   futuro; `gzip -9` compacta no nível máximo, economizando
-                  #   espaço em disco.
+                  #   facilita restaurar em outro ambiente/usuário no futuro.
+                  #
+                  #   IMPORTANTE: gravamos em um arquivo temporário em vez de
+                  #   `pg_dump | gzip -9 > arquivo` de propósito. Em um pipe
+                  #   de shell, o código de saída que o `set -e` enxerga é o
+                  #   do ÚLTIMO comando (`gzip`), não o do `pg_dump` — então
+                  #   se o Postgres estivesse inacessível (ex.: bloqueado por
+                  #   NetworkPolicy, como já aconteceu de verdade neste
+                  #   projeto), o `gzip` comprimia uma entrada vazia, saía
+                  #   com sucesso, e o script inteiro "dava certo" mesmo sem
+                  #   nenhum dado real ter sido salvo. Separando os dois
+                  #   comandos, uma falha do `pg_dump` interrompe o script
+                  #   AQUI de verdade (graças ao `set -e` no topo do script).
 
-                  echo "Backup concluído: ${ARQUIVO} ($(du -h "${ARQUIVO}" | cut -f1))"
+                  gzip -9 "${TMP_SQL}"
+                  mv "${TMP_SQL}.gz" "${ARQUIVO}"
+                  # ↑ `gzip -9` compacta no nível máximo (economiza espaço em
+                  #   disco) e, por padrão, já renomeia o arquivo para
+                  #   "<nome>.gz" — por isso o `mv` para o nome final.
+
+                  TAMANHO_BYTES=$(wc -c < "${ARQUIVO}")
+                  # ↑ Tamanho exato em bytes (não arredondado por tamanho de
+                  #   bloco como `du -h` faz — foi exatamente esse
+                  #   arredondamento que escondeu o bug de backups vazios
+                  #   antes desta correção, mostrando "4.0K" para um arquivo
+                  #   real de ~20 bytes).
+
+                  if [ "${TAMANHO_BYTES}" -lt 1024 ]; then
+                    echo "ERRO: o backup gerado tem apenas ${TAMANHO_BYTES} bytes — suspeito demais para ser um dump real do banco '${PGDATABASE}'. Algo deu errado (mesmo sem erro explícito do pg_dump/gzip). Abortando e removendo o arquivo inválido."
+                    rm -f "${ARQUIVO}"
+                    exit 1
+                  fi
+                  # ↑ Camada extra de segurança: mesmo que uma falha futura
+                  #   volte a passar despercebida pelo `set -e` (ex.: algum
+                  #   outro comando externo com comportamento inesperado),
+                  #   um backup real do Keycloak nunca fica abaixo de 1KB —
+                  #   isso força o Job a ser marcado como "Failed" (visível
+                  #   em `kubectl get jobs`) em vez de mascarar o problema.
+
+                  echo "Backup concluído: ${ARQUIVO} (${TAMANHO_BYTES} bytes)"
 
                   echo "Removendo backups com mais de 7 dias..."
                   find /backups -name "keycloak_*.sql.gz" -type f -mtime +7 -delete

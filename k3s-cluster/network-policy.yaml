@@ -13,24 +13,34 @@
 #   cluster já impede que ele alcance o banco de dados de credenciais do
 #   Keycloak diretamente.
 #
-# ⚠️ PRÉ-REQUISITO IMPORTANTE — LEIA ANTES DE DEPENDER DESTE ARQUIVO
-#   Uma NetworkPolicy só é EFETIVAMENTE aplicada (bloqueando tráfego de
-#   verdade) se o plugin de rede (CNI) do cluster souber interpretá-la. O
-#   K3s, por padrão, usa o Flannel como CNI — e o Flannel puro **NÃO
-#   ENFORCA NetworkPolicies** (ele apenas ignora este recurso, sem dar erro
-#   nenhum). Ou seja: aplicar este arquivo em um K3s "de fábrica" é 100%
-#   seguro e não quebra nada, mas a restrição descrita aqui só passa a ser
-#   REALMENTE aplicada se o cluster tiver um controlador de NetworkPolicy
-#   ativo (ex.: Calico, Cilium, ou kube-router rodando ao lado do Flannel).
+# ✅ CONFIRMADO AO VIVO: ESTA POLÍTICA É REALMENTE APLICADA NESTE CLUSTER
+#   Versões antigas deste documento afirmavam que o K3s, usando Flannel como
+#   CNI padrão, NÃO aplicaria NetworkPolicies — isso era uma suposição
+#   baseada em documentação genérica, e testamos ao vivo no cluster real
+#   para confirmar. O teste refutou a suposição: o K3s atual (a partir da
+#   versão instalada por scripts/bootstrap-vm.sh) já vem com um controlador
+#   de NetworkPolicy embutido, e a política É enforçada de verdade.
 #
-#   Deixamos esta política já declarada (boa prática de "documentar a
-#   intenção de segurança como código", e ativa automaticamente assim que
-#   um controlador compatível for instalado), mas trate-a como uma camada
-#   ADICIONAL — não como a única barreira. As senhas fortes do Secret e o
-#   isolamento do namespace continuam sendo a primeira linha de defesa.
-#   Consulte a documentação oficial do K3s sobre CNIs e NetworkPolicy
-#   (https://docs.k3s.io/networking) para avaliar se compensa migrar para
-#   um CNI com enforcement antes de considerar esta camada 100% ativa.
+#   Prova (reproduzível com `kubectl run` + `pg_isready`):
+#     - Pod SEM o rótulo `app: keycloak` tentando falar com o Postgres na
+#       porta 5432 -> BLOQUEADO ("no response" / connection refused).
+#     - Pod COM o rótulo `app: keycloak` -> permitido normalmente.
+#   Foi justamente essa aplicação real (e um Pod do CronJob de backup sem
+#   o rótulo certo) que causava backups vazios em produção — ver o
+#   histórico de correção no topo de postgres-backup-cronjob.yaml.
+#
+#   CONSEQUÊNCIA PRÁTICA PARA QUEM FOR ADICIONAR UM NOVO WORKLOAD:
+#   Qualquer novo Pod/Job/CronJob que precisar falar com o Postgres neste
+#   namespace só vai conseguir se (a) tiver um rótulo explicitamente
+#   permitido em algum `from:` abaixo, e (b) esse rótulo for adicionado ao
+#   `spec.template.metadata.labels` do recurso correspondente — um
+#   `podSelector` de NetworkPolicy NÃO enxerga rótulos herdados de
+#   Deployment/CronJob automaticamente, o Pod em si precisa carregá-los.
+#
+#   Não custa nada, ainda assim, tratar isto como camada ADICIONAL de
+#   defesa em profundidade — as senhas fortes do Secret e o isolamento do
+#   namespace continuam sendo a primeira linha de defesa, caso este cluster
+#   um dia troque de CNI para um que não aplique NetworkPolicy.
 # ==============================================================================
 
 apiVersion: networking.k8s.io/v1
@@ -77,13 +87,25 @@ spec:
               #   restringe implicitamente ao namespace desta própria
               #   NetworkPolicy).
 
+        - podSelector:
+            matchLabels:
+              app: postgres-backup
+              # ↑ Também permite o Pod do CronJob de backup diário
+              #   (k3s-cluster/postgres-backup-cronjob.yaml), que roda
+              #   `pg_dump` contra este mesmo Postgres. Duas entradas
+              #   separadas dentro de `from:` funcionam como "OU" — cada uma
+              #   é avaliada independentemente (não é a mesma coisa que
+              #   colocar as duas condições dentro de um único
+              #   `matchLabels`, que exigiria os DOIS rótulos ao mesmo
+              #   tempo no mesmo Pod).
+
       ports:
         - protocol: TCP
           port: 5432
-          # ↑ Restringe ainda mais: mesmo o Keycloak só pode falar com o
-          #   Postgres NESTA porta específica (a porta real do PostgreSQL),
-          #   fechando qualquer outra porta que o container eventualmente
-          #   exponha.
+          # ↑ Restringe ainda mais: mesmo os Pods autorizados acima só
+          #   podem falar com o Postgres NESTA porta específica (a porta
+          #   real do PostgreSQL), fechando qualquer outra porta que o
+          #   container eventualmente exponha.
 
 # ==============================================================================
 # COMO TESTAR SE A POLÍTICA ESTÁ SENDO REALMENTE APLICADA (após instalar um

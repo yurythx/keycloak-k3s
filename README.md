@@ -86,9 +86,10 @@ no K3s), que grava diretamente no disco físico da VM em
 **não apaga os dados**.
 
 **Segmentação de rede:** uma `NetworkPolicy` restringe o PostgreSQL para só
-aceitar conexões vindas dos Pods do Keycloak — nenhum outro workload do
-namespace consegue alcançar o banco (ver aviso sobre CNI/enforcement em
-`k3s-cluster/network-policy.yaml`).
+aceitar conexões vindas dos Pods do Keycloak (e do CronJob de backup) —
+nenhum outro workload do namespace consegue alcançar o banco. Confirmado
+ao vivo no cluster real que esta restrição é de fato aplicada pelo CNI
+(ver `k3s-cluster/network-policy.yaml`).
 
 **Backup:** um `CronJob` roda `pg_dump` todo dia às 03:00 (horário de
 Rondonópolis-MT), compacta o resultado e mantém os últimos 7 dias
@@ -226,12 +227,15 @@ sudo k3s kubectl get nodes
 > **Local Path Provisioner** (StorageClass `local-path`) habilitados por
 > padrão — não é preciso instalar nada extra para este projeto funcionar.
 
-> ⚠️ **Sobre a NetworkPolicy (`network-policy.yaml`):** o K3s usa Flannel
-> como CNI padrão, que **não enforça** NetworkPolicies (o recurso é
-> aceito pelo cluster, mas não bloqueia tráfego de verdade). Isso não
-> impede o deploy — é só uma camada de segurança que fica "adormecida"
-> até você, opcionalmente, migrar para um CNI com suporte a enforcement
-> (ex.: Calico). Veja o comentário completo dentro do próprio arquivo.
+> ✅ **Sobre a NetworkPolicy (`network-policy.yaml`):** testado ao vivo no
+> cluster real — o K3s atual já **aplica** NetworkPolicies de verdade
+> (bloqueia tráfego, não é só declarativo). Na prática, isso significa que
+> qualquer novo Pod que precise falar com o PostgreSQL só consegue se
+> tiver um dos rótulos explicitamente liberados no arquivo (`app:
+> keycloak` ou `app: postgres-backup`) — esquecer esse detalhe já causou
+> um bug real neste projeto (backups vazios, ver histórico em
+> `postgres-backup-cronjob.yaml`). Veja o comentário completo dentro do
+> próprio arquivo.
 
 ### 4.4. Configurar o `kubectl` para o usuário do Runner
 
@@ -427,9 +431,6 @@ extra de configuração de borda.
   necessária para proteger contra perda física do servidor — ver
   limitação detalhada em `postgres-backup-cronjob.yaml`.
 - **MFA obrigatório** no realm do Keycloak para todos os administradores.
-- **CNI com enforcement de NetworkPolicy** (ex.: Calico), caso a
-  segmentação de rede precise ser efetivamente bloqueante e não apenas
-  declarativa — ver aviso em `network-policy.yaml`.
 - **Monitorar a validade do certificado** gerenciado pelo Nginx da borda
   (fora do escopo deste repositório, mas crítico — um certificado vencido
   ali derruba o HTTPS de toda a stack).
