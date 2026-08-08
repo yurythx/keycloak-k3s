@@ -307,8 +307,22 @@ portas legadas (`18443`/`8081`) já estão preenchidos em `keycloak.yaml` e
    as portas que o K3s passa a ocupar. Ver `nginx-edge/README.md` para o
    detalhamento completo dessa decisão.
 3. **Federação com o Active Directory**: automatizada via
-   `k3s-cluster/ldap-federation-job.yaml` (um Job que roda `kcadm.sh` e
-   cria o Realm `rondonopolis` + o provider LDAP sozinho, a cada deploy).
+   `k3s-cluster/ldap-federation-job.yaml` (um Job que roda `kcadm.sh` e,
+   de forma idempotente, a cada deploy):
+   - Cria o Realm `rondonopolis` (login dos sistemas da prefeitura,
+     separado do `master`) e o provider LDAP (~7600 usuários reais
+     sincronizados, filtrados para excluir contas de computador/serviço).
+   - Sincroniza os GRUPOS do AD e concede a role `realm-admin` (admin só
+     deste realm, não do Keycloak inteiro) aos grupos `Domain Admins` e
+     `Departamento de Tecnologia da Informação` — qualquer membro desses
+     grupos no AD já consegue administrar o realm assim que logar.
+   - Cria um usuário LOCAL `prefeitura` (não federado do AD), também
+     admin do realm — conta de emergência que funciona mesmo se o AD
+     estiver fora do ar. Senha vem de `PREFEITURA_ADMIN_PASSWORD` em
+     `secrets.yaml` (mesmo padrão de senha fictícia do `kc_admin` — troque
+     antes de produção). Só é aplicada na criação; depois disso a senha
+     não é resetada em execuções seguintes do Job.
+
    Único passo manual necessário — criar, uma única vez, o Secret com a
    senha da conta de bind (nunca commitado no Git):
    ```bash
@@ -319,6 +333,15 @@ portas legadas (`18443`/`8081`) já estão preenchidos em `keycloak.yaml` e
    Sem esse Secret, o passo correspondente na pipeline é pulado
    (não derruba o resto do deploy) — crie-o e rode o workflow de novo
    (ou aguarde o próximo push) para ativar a federação.
+
+> 💡 **Onde testar login** (achado comum): o Admin Console padrão
+> (`/admin/master/console/`) só reconhece usuários do realm `master` —
+> um usuário do AD ou o `prefeitura` NUNCA vão logar ali, é esperado dar
+> "user not found". Teste no realm certo:
+> `https://sso.rondonopolis.mt.gov.br/admin/rondonopolis/console/` (Admin
+> Console do realm rondonopolis) ou
+> `https://sso.rondonopolis.mt.gov.br/realms/rondonopolis/account/`
+> (tela de conta do usuário comum).
 
 > ⚠️ **Duas pendências conhecidas na integração com o AD** (documentadas
 > em detalhe no cabeçalho de `ldap-federation-job.yaml`):
