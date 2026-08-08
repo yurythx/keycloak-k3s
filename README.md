@@ -4,17 +4,37 @@ Stack de autenticação e cofre de senhas, self-hosted, implantada em **K3s**
 via **GitOps** com **GitHub Actions** e um **Self-Hosted Runner** — sem
 nunca expor SSH ou a API do Kubernetes para a internet.
 
+Este não é um projeto de "um serviço só": é a integração deliberada de
+**seis peças que precisam funcionar em conjunto** — K3s, PostgreSQL,
+Keycloak (clusterizado), Active Directory/LDAP, o Nginx de borda já
+existente na rede da prefeitura, e o pipeline de GitOps que amarra tudo
+isso a um `git push`. Cada uma dessas integrações foi **testada ao vivo no
+cluster real** (não só escrita e assumida como correta) — a seção 7 lista
+exatamente o que foi validado, como, e que evidência prova que funciona.
+
 | Componente | Função | Réplicas | Domínio público | Porta na VM |
 |---|---|---|---|---|
-| **Keycloak 26 (Quarkus)** | Identity Provider (SSO, OIDC/SAML) para os sistemas da prefeitura | 2 (alta disponibilidade) | `sso.rondonopolis.mt.gov.br` | `18443` |
-| **PostgreSQL 16-alpine** | Banco de dados persistente do Keycloak | 1 | (interno, sem acesso externo) | — |
-| **Vaultwarden** | Cofre de senhas (compatível com Bitwarden) para as equipes de TI/administração | 1 | `cofre.rondonopolis.mt.gov.br` | `8081` |
+| **Keycloak 26 (Quarkus)** | Identity Provider (SSO, OIDC/SAML) para os sistemas da prefeitura, com federação de ~7.600 usuários reais do Active Directory | 2 (alta disponibilidade, cluster via DNS_PING) | `sso.rondonopolis.mt.gov.br` | `18443` |
+| **PostgreSQL 16-alpine** | Banco de dados persistente do Keycloak (realms, usuários, sessões) | 1 | (interno, sem acesso externo) | — |
+| **Vaultwarden** | Cofre de senhas (compatível com Bitwarden) para as equipes de TI/administração — hoje **não integrado** ao Keycloak (login próprio, separado — ver seção 7.6) | 1 | `cofre.rondonopolis.mt.gov.br` | `8081` |
 | **Nginx (fora do K3s)** | Servidor de borda **já existente** na rede da prefeitura — termina o HTTPS público | — | recebe os 2 domínios acima | 80/443 |
 
 Este repositório já está **100% pronto para ser aplicado na VM assim que
-ela existir** — os domínios reais, o clustering do Keycloak, o backup
-automático e a segmentação de rede já estão todos configurados nos
-manifestos. O que falta é só a parte física (seção 4).
+ela existir** — os domínios reais, o clustering do Keycloak, a federação
+com o AD, o backup automático e a segmentação de rede já estão todos
+configurados nos manifestos. O que falta é só a parte física (seção 5).
+
+## Índice
+
+1. [Arquitetura adotada](#1-arquitetura-adotada)
+2. [Consumo de memória](#2-consumo-de-memória-por-que-cabe-em-8gb-de-ram)
+3. [Estrutura do repositório](#3-estrutura-do-repositório)
+4. [Isso funciona em outra VM? (portabilidade)](#4-isso-funciona-em-outra-vm-portabilidade)
+5. [Passo a passo de implantação na VM](#5-passo-a-passo-de-implantação-na-vm)
+6. [Operações do dia a dia](#6-operações-do-dia-a-dia)
+7. [Integrações — o que conecta com o quê, e como foi validado](#7-integrações--o-que-conecta-com-o-quê-e-como-foi-validado)
+8. [Problemas reais já encontrados e corrigidos](#8-problemas-reais-já-encontrados-e-corrigidos)
+9. [Próximos passos recomendados](#9-próximos-passos-recomendados)
 
 ---
 
@@ -46,7 +66,7 @@ manifestos. O que falta é só a parte física (seção 4).
    │  Pod keycloak-2       │      │  (PVC dedicado 5Gi)  │
    │  (cache ispn/DNS_PING)│      └──────────────────────┘
    └──────────┬──────────┘
-              │  🔒 NetworkPolicy: só o Keycloak acessa a porta 5432
+              │  🔒 NetworkPolicy: só Keycloak + backup acessam a porta 5432
    ┌──────────▼──────────┐
    │  Service: postgres    │
    └──────────┬──────────┘
@@ -55,6 +75,13 @@ manifestos. O que falta é só a parte física (seção 4).
    │  (PVC dedicado 10Gi)   │      │ (pg_dump 03h, PVC 5Gi,  │
    └──────────────────────┘       │  retenção de 7 dias)    │
                                    └────────────────────────┘
+                             ▲
+                             │ LDAP (porta 389, sem TLS — ver seção 8)
+                  ┌──────────┴──────────┐
+                  │  Active Directory     │  Domain Controller da prefeitura
+                  │  rondonopolis.local   │  (192.168.0.101) — fora do K3s,
+                  │  (fora do K3s)        │  ~7.600 contas de usuário reais
+                  └──────────────────────┘
 ```
 
 **Por que cada serviço é exposto na MESMA porta que já usava antes (18443
@@ -68,7 +95,9 @@ equipe/processo — o K3s foi configurado para **ocupar exatamente as
 mesmas portas de antes**, via `Service` do tipo `LoadBalancer` (usando o
 ServiceLB embutido do K3s, sem precisar instalar nada extra). Resultado:
 **zero alterações necessárias no Nginx**. Detalhes completos em
-`nginx-edge/README.md`.
+`nginx-edge/README.md`. **Esta é uma decisão de migração, não uma
+limitação técnica** — veja a seção 4 para a alternativa recomendada caso
+você não tenha esse mesmo cenário de "substituir algo que já existe".
 
 **Namespace único:** todos os recursos vivem dentro de `authentication`,
 isolados do resto do cluster.
@@ -86,15 +115,20 @@ no K3s), que grava diretamente no disco físico da VM em
 **não apaga os dados**.
 
 **Segmentação de rede:** uma `NetworkPolicy` restringe o PostgreSQL para só
-aceitar conexões vindas dos Pods do Keycloak (e do CronJob de backup) —
+aceitar conexões vindas dos Pods do Keycloak e do CronJob de backup —
 nenhum outro workload do namespace consegue alcançar o banco. Confirmado
 ao vivo no cluster real que esta restrição é de fato aplicada pelo CNI
-(ver `k3s-cluster/network-policy.yaml`).
+(ver seção 8 e `k3s-cluster/network-policy.yaml`).
 
 **Backup:** um `CronJob` roda `pg_dump` todo dia às 03:00 (horário de
 Rondonópolis-MT), compacta o resultado e mantém os últimos 7 dias
 automaticamente, em um disco separado do disco de dados (ver limitação
 sobre backup off-site em `k3s-cluster/postgres-backup-cronjob.yaml`).
+
+**Federação com o Active Directory:** o Keycloak não gerencia usuários
+manualmente — ele consulta o AD da prefeitura (`rondonopolis.local`) em
+tempo real via LDAP, dentro de um Realm dedicado (`rondonopolis`,
+separado do `master`). Ver seção 7.2 para o detalhamento completo.
 
 ---
 
@@ -131,7 +165,7 @@ cargas de teste pesadas simultâneas nos primeiros deploys.
 keycloak-k3s/
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml                   # Pipeline GitOps (self-hosted runner, 12 passos)
+│       └── deploy.yml                   # Pipeline GitOps (self-hosted runner, 14 passos)
 ├── scripts/
 │   └── bootstrap-vm.sh                  # Script único: K3s + kubectl + runner
 ├── nginx-edge/                          # Cópia fiel do que já está no Nginx (referência, não aplicado)
@@ -140,22 +174,110 @@ keycloak-k3s/
 │   └── cofre.rondonopolis.mt.gov.br.conf
 ├── k3s-cluster/
 │   ├── namespaces.yaml                  # Namespace "authentication"
-│   ├── secrets.yaml                     # Credenciais (Postgres, Keycloak, Vaultwarden)
+│   ├── secrets.yaml                     # Credenciais (Postgres, Keycloak, Vaultwarden, AD)
 │   ├── postgres-db.yaml                 # PVC + Deployment + Service do PostgreSQL
-│   ├── keycloak.yaml                    # Service headless + Deployment + Services (interno + porta 18443)
+│   ├── keycloak.yaml                    # Service headless + Deployment + Services (interno + porta 18443) + tema
 │   ├── keycloak-theme.yaml              # ConfigMap: tema visual customizado (logo/cores) da prefeitura
 │   ├── vaultwarden.yaml                 # PVC + Deployment + Services (interno + porta 8081)
-│   ├── network-policy.yaml              # Restringe acesso ao Postgres só ao Keycloak
+│   ├── network-policy.yaml              # Restringe acesso ao Postgres só ao Keycloak + backup
 │   ├── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
-│   └── ldap-federation-job.yaml         # Job: cria Realm "rondonopolis" + federação com o AD + ativa o tema
+│   └── ldap-federation-job.yaml         # Job: cria Realm "rondonopolis" + federação com o AD + admins + tema
 └── README.md                            # Este arquivo
 ```
 
+Cada arquivo `.yaml`/`.sh`/`.conf` tem comentários explicando **linha a
+linha** o que cada parâmetro faz e, sempre que uma decisão não era óbvia,
+o porquê dela — este README dá a visão de conjunto; os arquivos individuais
+têm o detalhe técnico.
+
 ---
 
-## 4. Passo a passo de implantação na VM
+## 4. Isso funciona em outra VM? (portabilidade)
 
-### 4.1. Pré-requisitos
+**Resumo:** sim, com ajustes — a arquitetura e a automação são genéricas
+(K3s, GitOps, clustering do Keycloak, backup, NetworkPolicy), mas um
+punhado de valores neste repositório é **especificamente calibrado para a
+rede da Prefeitura de Rondonópolis-MT** e precisaria ser trocado antes de
+implantar em qualquer outro lugar (outra VM, outro órgão, outro ambiente).
+A tabela abaixo é a lista completa — não há nenhum outro valor
+"escondido" fora dela.
+
+### 4.1. Valores que PRECISAM mudar em uma VM/organização diferente
+
+| O quê | Onde | Valor atual (Rondonópolis) | Por quê é específico |
+|---|---|---|---|
+| Hostname público do Keycloak | `keycloak.yaml` → `KC_HOSTNAME` | `https://sso.rondonopolis.mt.gov.br` | Domínio real desta prefeitura |
+| IP confiável do proxy reverso | `keycloak.yaml` → `KC_PROXY_TRUSTED_ADDRESSES` | `192.168.0.218/32` (+ `10.42.0.0/16` interno, esse não muda) | IP do Nginx de borda **desta** rede |
+| Hostname público do Vaultwarden | `vaultwarden.yaml` → `DOMAIN` | `https://cofre.rondonopolis.mt.gov.br` | Domínio real desta prefeitura |
+| Porta legada do Keycloak | `keycloak.yaml` → Service `keycloak-external` | `18443` | Porta que o Nginx **desta** rede já espera (ver 4.2) |
+| Porta legada do Vaultwarden | `vaultwarden.yaml` → Service `vaultwarden-external` | `8081` | Idem |
+| Endereço do Domain Controller | `ldap-federation-job.yaml` → `AD_CONNECTION_URL` | `ldap://192.168.0.101:389` | IP do AD **desta** rede |
+| Base DN dos usuários no AD | `ldap-federation-job.yaml` → `AD_USERS_DN` | `DC=rondonopolis,DC=local` | Estrutura do domínio AD **desta** prefeitura |
+| Nome do Realm de destino | `ldap-federation-job.yaml` → `TARGET_REALM` | `rondonopolis` | Escolha de nome, livre para trocar |
+| Grupos do AD com direito de admin | `ldap-federation-job.yaml` → `ADMIN_GROUP_NAMES` | `Domain Admins\|Departamento de Tecnologia da Informação` | Nomes reais de grupos **deste** AD |
+| DN da conta de bind com o AD | `secrets.yaml` → `AD_BIND_DN` | `CN=adm.yuri,OU=...,DC=rondonopolis,DC=local` | Conta e estrutura de OUs **desta** prefeitura |
+| Senha da conta de bind | Secret `ad-bind-credentials` (criado manualmente, **não** está no Git) | — | Sempre específica do ambiente, por design |
+| Todas as senhas em `secrets.yaml` | `secrets.yaml` (`stringData`) | valores fictícios, claramente marcados | Devem ser geradas por ambiente — nunca reaproveitar |
+| Vhosts do Nginx de borda | `nginx-edge/*.conf` | cópia fiel dos vhosts reais desta prefeitura | Documentação/referência — **não é aplicado por este repo**; em outra rede, o Nginx (se existir) teria sua própria config, gerenciada fora deste projeto |
+| Dono/nome do repositório GitHub | `scripts/bootstrap-vm.sh` → `GH_OWNER`/`GH_REPO` | `yurythx`/`keycloak-k3s` | Já são variáveis de ambiente sobrepostas facilmente (`GH_OWNER=... GH_REPO=... ./bootstrap-vm.sh`) — não é preciso editar o script |
+
+### 4.2. A decisão arquitetural que só faz sentido NESTE cenário
+
+O ponto mais importante para quem for reusar este repositório em outro
+lugar: **o esquema de "ocupar as mesmas portas legadas" (18443/8081) é uma
+decisão de migração**, feita porque esta VM está substituindo um Keycloak
+e um Vaultwarden bare-metal que já existiam, com um Nginx de borda gerido
+por outra equipe que não podia (ou não devia precisar) ser reconfigurado.
+
+Se o cenário de destino for **greenfield** (VM nova, sem nada rodando
+antes, sem um Nginx externo já configurado), a recomendação é **não**
+replicar esse esquema — em vez disso, usar o Traefik que já vem embutido
+no K3s como Ingress Controller na porta 443, com um `cert-manager` para
+emitir certificados automaticamente (Let's Encrypt). É mais simples,
+mais padrão, e elimina a dependência de um Nginx externo por completo.
+Essa mudança afetaria basicamente só `keycloak.yaml` e `vaultwarden.yaml`
+(trocar `Service type: LoadBalancer` + portas custom por um `Ingress`
+comum) — o resto do repositório (Postgres, backup, NetworkPolicy,
+federação com AD, GitOps) é igualmente válido nos dois cenários.
+
+### 4.3. O que NÃO muda entre ambientes (já é genérico)
+
+- O mecanismo de instalação do K3s (`bootstrap-vm.sh`) — não tem nada
+  específico de Rondonópolis, só espera uma VM Linux comum.
+- O clustering do Keycloak via DNS_PING (headless Service +
+  `JAVA_OPTS_APPEND`) — genérico para qualquer K3s.
+- A estrutura da `NetworkPolicy` (rótulos `app: keycloak` /
+  `app: postgres-backup`) — genérica, só depende dos próprios manifestos
+  deste repositório.
+- O mecanismo de injeção do tema visual via ConfigMap — genérico; o
+  conteúdo do CSS/logo é que muda por organização (ver
+  `keycloak-theme.yaml`).
+- Toda a lógica do `deploy.yml` (ordem de aplicação, `wait`, tolerância a
+  Secret ausente) — genérica.
+- A filtragem de contas do AD (`objectCategory=person`, exclui contas de
+  computador/serviço) — prática padrão de qualquer federação AD→Keycloak,
+  não específica desta prefeitura.
+
+### 4.4. Checklist rápido para implantar do zero em uma VM nova
+
+1. Rode `scripts/bootstrap-vm.sh` (seção 5.2) — nenhuma edição necessária
+   para esta parte.
+2. Edite os 8 valores da tabela 4.1 que se aplicam ao seu caso (pule os de
+   AD se não for federar com um Active Directory).
+3. Decida entre manter o esquema de portas legadas (4.1) ou migrar para
+   Ingress+cert-manager (4.2) — **isso não é automático**, é uma escolha
+   consciente de arquitetura.
+4. Gere segredos novos e reais em `secrets.yaml` (nunca reaproveite os
+   valores fictícios deste repositório).
+5. Crie manualmente o Secret `ad-bind-credentials` (se for usar federação
+   com AD) — é o único segredo que propositalmente não vive no Git.
+6. `git push` — o resto é automático.
+
+---
+
+## 5. Passo a passo de implantação na VM
+
+### 5.1. Pré-requisitos
 
 - VM Bare Metal/Proxmox com **Linux** (Ubuntu Server 22.04/24.04
   recomendado), **8GB de RAM**, acesso root/sudo.
@@ -165,10 +287,13 @@ keycloak-k3s/
 - Os domínios `sso.rondonopolis.mt.gov.br` e `cofre.rondonopolis.mt.gov.br`
   já existiam em produção antes (Keycloak/Vaultwarden bare-metal) — o DNS
   já deve estar correto, apontando para o IP público do Nginx da borda.
+- Se for federar com o Active Directory: conectividade da VM até o Domain
+  Controller na porta 389 (ou 636, se/quando LDAPS for habilitado — ver
+  seção 8).
 
-### 4.2. Opção A (recomendada): script único de bootstrap automatizado
+### 5.2. Opção A (recomendada): script único de bootstrap automatizado
 
-Em vez de digitar os comandos das seções 4.3 a 4.4 um por um, o script
+Em vez de digitar os comandos das seções 5.3 a 5.4 um por um, o script
 [`scripts/bootstrap-vm.sh`](scripts/bootstrap-vm.sh) faz tudo de uma vez:
 instala o K3s, configura o `kubectl` para o seu usuário e — se você
 fornecer um token do GitHub — registra e inicia o Self-Hosted Runner. É
@@ -182,7 +307,7 @@ git clone https://github.com/yurythx/keycloak-k3s.git
 cd keycloak-k3s
 chmod +x scripts/bootstrap-vm.sh
 
-# Opção sem registro automático do runner (registra na mão depois, seção 4.5):
+# Opção sem registro automático do runner (registra na mão depois, seção 5.5):
 sudo ./scripts/bootstrap-vm.sh
 
 # Opção com registro automático do runner — gere antes um Personal Access
@@ -193,7 +318,7 @@ sudo GH_PAT="ghp_xxx_seu_token" ./scripts/bootstrap-vm.sh
 ```
 
 O script imprime, ao final, exatamente o que ainda falta fazer fora dele
-(editar segredos) — pule direto para a seção 4.6.
+(editar segredos) — pule direto para a seção 5.6.
 
 > O token (`GH_PAT`) só é usado em memória, na hora de chamar a API do
 > GitHub para pegar um token de registro temporário (válido ~1h) — nunca é
@@ -204,7 +329,7 @@ Se preferir entender/rodar cada comando manualmente (ou se algo no script
 falhar e você precisar diagnosticar um passo específico), siga a **Opção B**
 abaixo — é exatamente o que o script automatiza por baixo dos panos.
 
-### 4.3. Opção B: instalar o K3s manualmente
+### 5.3. Opção B: instalar o K3s manualmente
 
 Conecte-se na VM (localmente ou via um acesso já existente) e rode:
 
@@ -233,11 +358,10 @@ sudo k3s kubectl get nodes
 > qualquer novo Pod que precise falar com o PostgreSQL só consegue se
 > tiver um dos rótulos explicitamente liberados no arquivo (`app:
 > keycloak` ou `app: postgres-backup`) — esquecer esse detalhe já causou
-> um bug real neste projeto (backups vazios, ver histórico em
-> `postgres-backup-cronjob.yaml`). Veja o comentário completo dentro do
-> próprio arquivo.
+> um bug real neste projeto (backups vazios, ver seção 8). Veja o
+> comentário completo dentro do próprio arquivo.
 
-### 4.4. Configurar o `kubectl` para o usuário do Runner
+### 5.4. Configurar o `kubectl` para o usuário do Runner
 
 ```bash
 # Cria a pasta padrão de configuração do kubectl para o seu usuário.
@@ -254,9 +378,9 @@ sudo chown $(id -u):$(id -g) ~/.kube/config
 kubectl get nodes
 ```
 
-### 4.5. Registrar o Self-Hosted Runner do GitHub Actions
+### 5.5. Registrar o Self-Hosted Runner do GitHub Actions
 
-> Pule esta seção se você já rodou o script da seção 4.2 com `GH_PAT`
+> Pule esta seção se você já rodou o script da seção 5.2 com `GH_PAT`
 > definido — o runner já está registrado e ativo.
 
 No GitHub: **Settings → Actions → Runners → New self-hosted runner**
@@ -295,11 +419,13 @@ sudo ./svc.sh status
 > porta de entrada no firewall para o runner funcionar. Rode-o com um
 > usuário Linux SEM privilégios de root (o instalador já orienta isso).
 
-### 4.6. Ajustes finais de conteúdo (antes do primeiro deploy)
+### 5.6. Ajustes finais de conteúdo (antes do primeiro deploy)
 
 Os domínios, IPs (VM `192.168.0.225`, Nginx da borda `192.168.0.218`) e as
 portas legadas (`18443`/`8081`) já estão preenchidos em `keycloak.yaml` e
-`vaultwarden.yaml` — nada a fazer aí. O que ainda precisa de atenção:
+`vaultwarden.yaml` — nada a fazer aí **nesta VM específica** (se for outra
+VM/organização, veja a tabela completa na seção 4.1). O que ainda precisa
+de atenção:
 
 1. **Troque todas as senhas fictícias** em `k3s-cluster/secrets.yaml` (veja
    o passo a passo detalhado dentro do próprio arquivo — inclui como gerar
@@ -313,20 +439,8 @@ portas legadas (`18443`/`8081`) já estão preenchidos em `keycloak.yaml` e
    detalhamento completo dessa decisão.
 3. **Federação com o Active Directory**: automatizada via
    `k3s-cluster/ldap-federation-job.yaml` (um Job que roda `kcadm.sh` e,
-   de forma idempotente, a cada deploy):
-   - Cria o Realm `rondonopolis` (login dos sistemas da prefeitura,
-     separado do `master`) e o provider LDAP (~7600 usuários reais
-     sincronizados, filtrados para excluir contas de computador/serviço).
-   - Sincroniza os GRUPOS do AD e concede a role `realm-admin` (admin só
-     deste realm, não do Keycloak inteiro) aos grupos `Domain Admins` e
-     `Departamento de Tecnologia da Informação` — qualquer membro desses
-     grupos no AD já consegue administrar o realm assim que logar.
-   - Cria um usuário LOCAL `prefeitura` (não federado do AD), também
-     admin do realm — conta de emergência que funciona mesmo se o AD
-     estiver fora do ar. Senha vem de `PREFEITURA_ADMIN_PASSWORD` em
-     `secrets.yaml` (mesmo padrão de senha fictícia do `kc_admin` — troque
-     antes de produção). Só é aplicada na criação; depois disso a senha
-     não é resetada em execuções seguintes do Job.
+   de forma idempotente, a cada deploy) — ver seção 7.2 para o
+   funcionamento completo.
 
    Único passo manual necessário — criar, uma única vez, o Secret com a
    senha da conta de bind (nunca commitado no Git):
@@ -348,23 +462,14 @@ portas legadas (`18443`/`8081`) já estão preenchidos em `keycloak.yaml` e
 > `https://sso.rondonopolis.mt.gov.br/realms/rondonopolis/account/`
 > (tela de conta do usuário comum).
 
-> ⚠️ **Duas pendências conhecidas na integração com o AD** (documentadas
-> em detalhe no cabeçalho de `ldap-federation-job.yaml`):
-> 1. **Conexão sem criptografia (LDAP, porta 389)**: testado direto contra
->    o Domain Controller (`192.168.0.101`) — nem LDAPS (636) nem StartTLS
->    completam o handshake TLS (falta certificado configurado no serviço
->    LDAP do Windows Server). Decisão consciente: seguir sem criptografia
->    por enquanto. Assim que o time de infra configurar um certificado no
->    DC, troque `AD_CONNECTION_URL` para `ldaps://192.168.0.101:636` no
->    Job.
-> 2. **Conta de bind administrativa** (`adm.yuri`): usar uma conta admin
->    do domínio para consultas de LDAP não é o ideal — o ambiente mais
->    seguro usaria uma conta de serviço dedicada, só leitura. Funcional
->    como está, mas vale trocar quando possível (só editar `AD_BIND_DN`
->    em `secrets.yaml` e recriar o Secret `ad-bind-credentials` com a
->    senha da nova conta).
+> ⚠️ **Duas pendências conhecidas na integração com o AD** (detalhe
+> completo na seção 7.2 e no cabeçalho de `ldap-federation-job.yaml`):
+> 1. Conexão sem criptografia (LDAP, porta 389) — DC ainda sem certificado
+>    configurado para LDAPS/StartTLS.
+> 2. Conta de bind administrativa (`adm.yuri`) em vez de uma conta de
+>    serviço dedicada só leitura.
 
-### 4.7. Disparar o primeiro deploy
+### 5.7. Disparar o primeiro deploy
 
 ```bash
 git add .
@@ -374,10 +479,10 @@ git push origin main
 
 Acompanhe a execução em **Actions** no GitHub — o job `aplicar-manifestos`
 vai rodar no seu runner self-hosted e aplicar os manifestos em ordem lógica:
-Namespace → Secrets → PostgreSQL → NetworkPolicy → Backup CronJob →
-Keycloak → Vaultwarden.
+Namespace → Secrets → PostgreSQL → NetworkPolicy → Backup CronJob → tema
+do Keycloak → Keycloak → Vaultwarden → federação com o AD.
 
-### 4.8. Validar a implantação
+### 5.8. Validar a implantação
 
 ```bash
 kubectl get pods -n authentication -o wide
@@ -398,7 +503,7 @@ extra de configuração de borda.
 
 ---
 
-## 5. Operações do dia a dia
+## 6. Operações do dia a dia
 
 | Tarefa | Comando |
 |---|---|
@@ -410,10 +515,154 @@ extra de configuração de borda.
 | Ver uso de RAM/CPU real dos Pods | `kubectl top pods -n authentication` |
 | Testar as portas legadas sem depender do Nginx | `curl -I http://IP_DA_VM:18443/` e `curl -I http://IP_DA_VM:8081/` |
 | Forçar reaplicação dos manifestos | Aba **Actions** → workflow **Deploy Auth Stack para o K3s** → **Run workflow** |
+| Reprocessar a federação com o AD manualmente | `kubectl delete job ldap-federation-setup -n authentication --ignore-not-found && kubectl apply -f k3s-cluster/ldap-federation-job.yaml` |
+| Ver o resultado da última sincronização com o AD | `kubectl logs -n authentication job/ldap-federation-setup` |
 
 ---
 
-## 6. Próximos passos recomendados (fora do escopo inicial)
+## 7. Integrações — o que conecta com o quê, e como foi validado
+
+Esta seção existe porque "escrever um YAML que parece certo" e "confirmar
+que a integração funciona de verdade" são coisas diferentes — cada item
+abaixo foi testado ao vivo contra o cluster e/ou o AD reais desta
+prefeitura, não apenas assumido a partir da documentação oficial das
+ferramentas.
+
+### 7.1. PostgreSQL ↔ Keycloak
+
+O Keycloak se conecta ao Postgres via o nome do Service Kubernetes
+(`postgres`, resolvido por DNS interno do cluster), usando as credenciais
+do Secret `auth-stack-credentials`. **Validado**: os Pods do Keycloak só
+ficam com status `Ready` depois de rodar com sucesso as migrations do
+banco na primeira inicialização (visível nos logs, `kubectl logs -n
+authentication -l app=keycloak`) — se a conexão falhasse, o Pod ficaria
+preso em `CrashLoopBackOff`, o que não acontece no cluster real.
+
+### 7.2. Active Directory (LDAP) ↔ Keycloak
+
+A integração mais complexa do projeto, feita via `ldap-federation-job.yaml`
+— um Job que roda `kcadm.sh` (CLI oficial de administração do Keycloak) de
+forma **idempotente** a cada deploy:
+
+1. Cria o Realm `rondonopolis` (separado do `master`, onde só administram
+   quem precisa administrar a infraestrutura do próprio Keycloak).
+2. Cria um provedor de identidade LDAP apontando para o Domain Controller
+   (`192.168.0.101:389`), com `customUserSearchFilter=(objectCategory=person)`
+   para trazer só contas de usuário reais — excluindo automaticamente
+   contas de computador/serviço que também vivem no mesmo diretório.
+3. Sincroniza grupos do AD via um `group-ldap-mapper`.
+4. Concede a role `realm-admin` (administrador só deste realm, não do
+   Keycloak inteiro) a qualquer usuário que pertença aos grupos AD
+   `Domain Admins` ou `Departamento de Tecnologia da Informação`.
+5. Cria um usuário local `prefeitura` (não federado do AD) como conta de
+   emergência — funciona mesmo se o AD estiver fora do ar.
+6. Ativa o tema visual customizado (`prefeitura`) no realm.
+
+**Validado ao vivo**, com evidências concretas:
+- Sincronização real trouxe **7.608 usuários** genuínos do AD (confirmado
+  contando registros, não só "o Job terminou sem erro").
+- Testado que o filtro `objectCategory=person` é necessário: sem ele, a
+  primeira tentativa trouxe **5.797 contas de computador/serviço** junto
+  (bug real, corrigido — ver seção 8).
+- Login de um usuário real do AD testado e funcionando no realm certo.
+- Concessão de `realm-admin` aos dois grupos verificada não só pelo
+  `kcadm.sh get-roles`, mas diretamente pelo endpoint REST
+  `groups/{id}/role-mappings/clients/{clientId}`, porque o primeiro se
+  mostrou pouco confiável para roles de cliente em alguns casos.
+- Usuário local `prefeitura` testado com login real, senha resetada e
+  reconfirmada ao vivo.
+
+Pendências conhecidas (não bloqueiam o funcionamento, documentadas para
+acompanhamento): conexão ainda sem TLS (porta 389, não 636 — o DC não tem
+certificado configurado para LDAPS/StartTLS, testado diretamente com
+`openssl s_client` e `ldapsearch -ZZ`) e uso de uma conta administrativa
+(`adm.yuri`) como conta de bind, em vez de uma conta de serviço dedicada
+só leitura.
+
+### 7.3. Nginx (borda, fora do K3s) ↔ K3s
+
+O Nginx que já existe na rede da prefeitura não foi tocado — nenhuma linha
+de configuração dele foi alterada. Em vez disso, o K3s foi configurado
+para ocupar as MESMAS portas (`18443` para o Keycloak, `8081` para o
+Vaultwarden) que os serviços bare-metal antigos ocupavam, via `Service`
+do tipo `LoadBalancer` com `externalTrafficPolicy: Local` (preserva o IP
+real de quem conecta, importante para auditoria/logs — só funciona porque
+o cluster é single-node).
+
+**Validado**: `curl -I` local na VM contra `localhost:18443` e
+`localhost:8081` respondendo corretamente, e — mais importante — acesso
+real via navegador aos domínios públicos (`https://sso.rondonopolis.mt.gov.br`
+e `https://cofre.rondonopolis.mt.gov.br`) funcionando de ponta a ponta
+através do Nginx real, sem qualquer alteração nele.
+
+### 7.4. GitHub Actions (Self-Hosted Runner) ↔ K3s
+
+O runner roda dentro da própria VM e se autentica na API do Kubernetes
+usando o kubeconfig local do K3s — não há credencial nenhuma trafegando
+pela internet para isso. A conexão com o GitHub é sempre de **saída**
+(o runner "puxa" trabalho, o GitHub nunca "empurra" para dentro da rede
+da prefeitura), então nenhuma porta de entrada precisa ser aberta no
+firewall.
+
+**Validado**: múltiplos deploys reais rodados de ponta a ponta (`git push`
+→ pipeline aplica os manifestos → recursos atualizados no cluster),
+incluindo a correção de bugs descobertos durante este mesmo processo de
+verificação (seção 8).
+
+### 7.5. CronJob de backup ↔ PostgreSQL
+
+Ver seção 8 — esta integração **estava quebrada silenciosamente** (backups
+vazios) e foi corrigida e re-validada durante esta auditoria, com teste
+real: `kubectl create job --from=cronjob/postgres-backup`, confirmando um
+arquivo `.sql.gz` de conteúdo real (não vazio) no volume persistente
+dedicado.
+
+### 7.6. Vaultwarden — hoje NÃO integrado ao Keycloak
+
+Importante deixar explícito: o Vaultwarden está implantado **lado a lado**
+com o Keycloak (mesmo namespace, mesmo cluster, mesmo Nginx de borda),
+mas não há **nenhuma integração de login** entre os dois hoje — o
+Vaultwarden usa seu próprio sistema de contas/senhas, totalmente
+independente do Realm `rondonopolis` ou do AD. Quem for administrar ambos
+precisa de duas credenciais separadas. Vaultwarden tem suporte a login via
+OIDC/SSO nativamente (é um recurso do próprio Bitwarden/Vaultwarden), mas
+configurar o Keycloak como provedor OIDC para ele **não foi feito neste
+projeto** — é um passo futuro natural, não uma integração existente.
+
+---
+
+## 8. Problemas reais já encontrados e corrigidos
+
+Esta stack não foi só escrita — foi **testada em produção real**, e vários
+comportamentos "óbvios" da documentação oficial se mostraram diferentes na
+prática. Registrar isso aqui evita repetir a mesma investigação:
+
+| Problema | Sintoma | Causa raiz | Correção |
+|---|---|---|---|
+| Keycloak em `CrashLoopBackOff` | Pod reiniciando sem parar | Flag `--optimized` exige uma imagem pré-otimizada em build, e a imagem oficial usada aqui não é | Trocado para `start` (sem `--optimized`) |
+| `KC_CACHE=ha` inválido | Erro de configuração ao subir | `ha` não é um valor válido nesta versão — o correto é `ispn` | `KC_CACHE=ispn`, removida a referência a um `cache-ha.xml` que nunca existiu de fato |
+| Cluster do Keycloak nunca formava | 2 réplicas rodando isoladas, sem se enxergar | KUBE_PING (RBAC) foi a primeira tentativa e é o mecanismo errado para este cenário | Trocado para DNS_PING: Service headless + `JAVA_OPTS_APPEND=-Djgroups.dns.query=...` |
+| Runner registrado no diretório errado | `RUNNER_DIR` apontando para `/root` mesmo rodando como usuário comum | Calculado a partir de `$HOME` ANTES de resolver o usuário real por trás do `sudo` | Recalculado depois de resolver `TARGET_HOME` via `SUDO_USER`/`getent passwd` |
+| Pipeline disparando 3x seguidas | Vários deploys enfileirados rodando em sequência | `concurrency.cancel-in-progress: false` deixava execuções antigas na fila | Trocado para `true` |
+| LDAPS/StartTLS falhando no AD | `errno=104` (reset de conexão) / `ldap_start_tls: Server is unavailable (52)` | DC sem certificado configurado para o serviço LDAP | Decisão consciente: LDAP simples (389) por enquanto — ver seção 7.2 |
+| Sincronização trazendo "usuários" errados | 5.797 contas de computador/serviço junto com os usuários reais | Faltava o filtro `objectCategory=person` no provedor LDAP | Adicionado `customUserSearchFilter=["(objectCategory=person)"]` |
+| Script do Job de federação falhando silenciosamente / duplicando recursos | Múltiplos providers LDAP e mappers duplicados criados em execuções sucessivas | A imagem oficial do Keycloak (UBI-minimal) **não tem `awk`** — o script usava `awk` para parsear a saída do `kcadm.sh`, e isso só funcionava quando testado no shell da VM, não dentro do container do Job | Reescrito com uma função pura em bash (`find_id_by_exact_name`), sem depender de `awk`/`curl`/`tar`/`jq`, nenhum dos quais existe na imagem |
+| Backups aparentemente OK, mas vazios | Arquivos `.sql.gz` de ~20 bytes, log dizendo "Backup concluído (4.0K)" | Dois problemas combinados: (1) o Pod do CronJob não tinha rótulo permitido pela `NetworkPolicy`, sendo bloqueado de acessar o Postgres; (2) o script usava `pg_dump \| gzip`, e em um pipe o `set -e` só vê o código de saída do ÚLTIMO comando (`gzip`), então uma falha do `pg_dump` passava despercebida | Adicionado o rótulo `app: postgres-backup` + regra correspondente na `NetworkPolicy`; script reescrito para separar `pg_dump` de `gzip` e checar o tamanho mínimo do arquivo gerado (ver commit que corrigiu isto) |
+| Suposição sobre NetworkPolicy no Flannel | Documentação afirmava que o Flannel do K3s não aplica NetworkPolicies | Suposição baseada em documentação genérica, nunca testada neste cluster específico | Testado ao vivo (par de Pods com/sem o rótulo certo tentando alcançar o Postgres) — a suposição estava **errada**: este cluster aplica a política de verdade. Documentação corrigida em todo o repositório |
+| `kubectl cp` falhando ao inspecionar o tema do Keycloak | Erro ao tentar extrair o JAR do tema de dentro do Pod | A imagem também não tem `tar`, usado internamente pelo `kubectl cp` | Extração feita com `kubectl exec ... -- cat arquivo > arquivo_local` (redirecionamento puro de stdout, funciona até para binário) |
+
+**Padrão comum por trás da maioria destes problemas**: a imagem oficial do
+Keycloak 26 (baseada em UBI-minimal) é muito mais enxuta do que se costuma
+assumir — **não tem** `curl`, `awk`, `tar`, `unzip`, `python3`, `perl` nem
+`jq`, só `bash`/`sh`/`grep`/`sed`/`cut`/`tr`/`java`. Qualquer script que
+rode dentro de um container baseado nela (como o Job de federação com o
+AD) precisa ser escrito considerando essa limitação — testar "no shell da
+VM" não é a mesma coisa que testar "dentro do container", e essa diferença
+já causou bugs reais neste projeto.
+
+---
+
+## 9. Próximos passos recomendados
 
 - **Certificado LDAPS no Domain Controller**: a federação com o AD já está
   automatizada (`ldap-federation-job.yaml`), mas roda hoje sem
@@ -423,14 +672,21 @@ extra de configuração de borda.
   `ldaps://192.168.0.101:636`.
 - **Conta de bind dedicada para o AD**: hoje usa uma conta administrativa
   (`adm.yuri`) por conveniência — trocar por uma conta de serviço só
-  leitura assim que possível (ver seção 4.6).
+  leitura assim que possível (ver seção 5.6).
 - **Sealed Secrets / SOPS**: para versionar segredos criptografados no Git
   em vez de texto plano (ver aviso detalhado em `secrets.yaml`).
-- **Backup off-site**: o CronJob já grava backups diários no disco da VM,
-  mas uma cópia adicional para fora da VM (outro datacenter/nuvem) é
-  necessária para proteger contra perda física do servidor — ver
-  limitação detalhada em `postgres-backup-cronjob.yaml`.
+- **Backup off-site**: o CronJob já grava backups diários no disco da VM
+  (e agora, de fato, com conteúdo real — ver seção 8), mas uma cópia
+  adicional para fora da VM (outro datacenter/nuvem) é necessária para
+  proteger contra perda física do servidor — ver limitação detalhada em
+  `postgres-backup-cronjob.yaml`.
 - **MFA obrigatório** no realm do Keycloak para todos os administradores.
+- **Tema visual da prefeitura**: o mecanismo já está pronto e ativo
+  (`keycloak-theme.yaml`), falta só o arquivo de logo e as cores
+  institucionais oficiais para deixar de ser um esqueleto visualmente
+  idêntico ao tema padrão.
+- **Login unificado do Vaultwarden via OIDC** contra o Keycloak (ver
+  seção 7.6) — hoje são dois sistemas de credenciais separados.
 - **Monitorar a validade do certificado** gerenciado pelo Nginx da borda
   (fora do escopo deste repositório, mas crítico — um certificado vencido
   ali derruba o HTTPS de toda a stack).
@@ -439,4 +695,5 @@ extra de configuração de borda.
 
 **Dúvidas ou problemas?** Cada arquivo `.yaml`/`.sh`/`.conf` deste
 repositório tem comentários explicando linha a linha o que cada parâmetro
-faz — comece por lá antes de alterar qualquer valor.
+faz — comece por lá antes de alterar qualquer valor. Para problemas já
+vividos e resolvidos, veja a seção 8 antes de investigar do zero.
