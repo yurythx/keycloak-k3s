@@ -320,6 +320,17 @@ spec:
                 echo "   em secrets.yaml) e role 'realm-admin' concedida."
               fi
 
+              echo ">> Ativando o tema visual 'prefeitura' na tela de login do realm..."
+              "$KCADM" update "realms/$TARGET_REALM" -s loginTheme=prefeitura
+              # ↑ Não relacionado à federação com o AD em si — reaproveita
+              #   a mesma sessão autenticada deste Job só por conveniência
+              #   (evita criar outro Job só para 1 comando). Idempotente
+              #   por natureza: "update" sempre define o campo para o
+              #   mesmo valor, não importa quantas vezes rodar. O tema em
+              #   si (arquivos/CSS) vem de `k3s-cluster/keycloak-theme.yaml`
+              #   — troque o CONTEÚDO daquele arquivo para mudar cores/logo,
+              #   não este comando.
+
               echo ">> Concluído."
           # ↑ Fim do script. Nota sobre os campos do provider (todos com
           #   comentário porque cada um foi verificado antes de usar, não

@@ -394,6 +394,41 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
 
+          volumeMounts:
+            # ↑ Injeta os arquivos do tema customizado "prefeitura" (ver
+            #   keycloak-theme.yaml) dentro da imagem oficial do Keycloak,
+            #   sem precisar buildar uma imagem Docker própria. Cada
+            #   arquivo do ConfigMap é montado INDIVIDUALMENTE (via
+            #   `subPath`) no caminho exato que o Keycloak espera dentro
+            #   da estrutura de um tema — ver
+            #   `/opt/keycloak/themes/<nome>/login/...` no cabeçalho de
+            #   keycloak-theme.yaml para o porquê dessa estrutura.
+            - name: theme-prefeitura
+              mountPath: /opt/keycloak/themes/prefeitura/login/theme.properties
+              subPath: theme.properties
+            - name: theme-prefeitura
+              mountPath: /opt/keycloak/themes/prefeitura/login/resources/css/custom.css
+              subPath: custom.css
+            # ↑ Quando o logo.png for adicionado ao ConfigMap (ver
+            #   instruções no final de keycloak-theme.yaml), adicione aqui
+            #   mais um item seguindo o mesmo padrão:
+            #   - name: theme-prefeitura
+            #     mountPath: /opt/keycloak/themes/prefeitura/login/resources/img/logo.png
+            #     subPath: logo.png
+
+      volumes:
+        - name: theme-prefeitura
+          configMap:
+            name: keycloak-theme-prefeitura
+        # ↑ ⚠️ Alterar o CONTEÚDO do ConfigMap (ex.: adicionar a cor real)
+        #   não exige mudar esta lista de volumes — o Kubernetes atualiza
+        #   o arquivo montado sozinho em segundos. MAS o Keycloak, rodando
+        #   em modo produção (`start`, não `start-dev`), MANTÉM O TEMA EM
+        #   CACHE em memória — então depois de editar keycloak-theme.yaml
+        #   e dar `git push`, rode também:
+        #     kubectl rollout restart deployment/keycloak -n authentication
+        #   para os Pods relerem o tema atualizado do disco.
+
       # (Sem tolerations/nodeSelector — cluster single-node não precisa.)
 
 ---

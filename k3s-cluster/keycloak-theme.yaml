@@ -1,0 +1,117 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/keycloak-theme.yaml
+# ------------------------------------------------------------------------------
+# OBJETIVO
+#   Tema visual customizado ("prefeitura") para a tela de login do Keycloak
+#   — troca o logo e a cor principal (botão de login, links) pela
+#   identidade visual da Prefeitura de Rondonópolis-MT, sem precisar de
+#   uma imagem Docker customizada (o tema é injetado via ConfigMap,
+#   montado direto na imagem oficial do Keycloak).
+#
+# ⚠️ ESTADO ATUAL: ESQUELETO PRONTO, AGUARDANDO LOGO/CORES REAIS
+#   Este arquivo já deixa o mecanismo funcionando (o tema "prefeitura"
+#   já existe e já pode ser selecionado/ativado), mas ainda está
+#   visualmente IDÊNTICO ao tema padrão do Keycloak — falta:
+#     1. O arquivo do logo (`resources/img/logo.png`, ainda não incluído).
+#     2. A cor institucional real (`--pf-v5-global--primary-color--100`,
+#        ainda comentada abaixo com um valor de exemplo).
+#   Assim que esses dois itens chegarem, é só editar o CSS/adicionar a
+#   imagem aqui e dar `git push` — nenhuma mudança de infraestrutura
+#   adicional é necessária (o mecanismo de montagem já está pronto).
+#
+# COMO DESCOBRIMOS A ESTRUTURA CERTA (não foi adivinhado)
+#   O tema padrão do Keycloak 26 ("keycloak.v2") NÃO tem uma imagem de
+#   logo — usa só texto (o "Display name" do Realm). Extraímos o JAR real
+#   de dentro do Pod em execução
+#   (`/opt/keycloak/lib/lib/main/org.keycloak.keycloak-themes-26.0.8.jar`)
+#   e confirmamos, no `template.ftl` e no `styles.css` REAIS:
+#     - O texto do cabeçalho fica em `<div id="kc-header-wrapper"
+#       class="pf-v5-c-brand">` — por isso usamos esse mesmo seletor CSS
+#       para sobrepor um logo via `background-image`.
+#     - A cor do botão de login vem, através de uma cadeia de variáveis
+#       CSS do PatternFly 5, de `--pf-v5-global--primary-color--100`
+#       (confirmado rastreando `.pf-v5-c-button.pf-m-primary` até a
+#       variável raiz no CSS vendorizado real).
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-theme-prefeitura
+  namespace: authentication
+
+data:
+  # ----------------------------------------------------------------------
+  # theme.properties — o "manifesto" do tema: de qual tema base ele herda
+  # (tudo que não sobrescrevemos aqui continua igual ao padrão) e quais
+  # arquivos CSS adicionais carregar.
+  # ----------------------------------------------------------------------
+  theme.properties: |
+    parent=keycloak.v2
+    # ↑ Herda TUDO do tema novo padrão do Keycloak 26 (layout, textos,
+    #   comportamento) — nosso tema só ADICIONA um CSS por cima, não
+    #   reescreve nada estruturalmente. Muito mais seguro/fácil de manter
+    #   do que copiar e modificar os templates inteiros.
+
+    styles=css/custom.css
+    # ↑ Carrega nosso CSS customizado DEPOIS do CSS padrão do tema pai —
+    #   por isso nossas regras conseguem sobrescrever as dele (CSS mais
+    #   específico/mais recente na ordem de carregamento vence).
+
+  # ----------------------------------------------------------------------
+  # custom.css — cores e logo da prefeitura (a preencher)
+  # ----------------------------------------------------------------------
+  custom.css: |
+    /* ==========================================================
+       Tema da Prefeitura de Rondonópolis-MT — tela de login
+       ==========================================================
+       Status: ESQUELETO — ainda sem cor/logo reais aplicados.
+       Ver o cabeçalho de k3s-cluster/keycloak-theme.yaml para o
+       porquê de cada seletor usado abaixo ter sido escolhido. */
+
+    /* --- Cor institucional principal (botão de login, links) -----------
+       Descomente e ajuste o valor hexadecimal quando tiver a cor oficial.
+       Sobrescrevemos as 3 variantes (base, light, dark) porque o CSS do
+       PatternFly usa uma ou outra dependendo do contexto (fundo claro vs
+       escuro da página) — sobrescrever só uma deixaria a outra com a cor
+       azul padrão do Keycloak em algum estado (ex.: modo escuro do SO). */
+    /*
+    :root {
+      --pf-v5-global--primary-color--100: #0B5FA5;
+      --pf-v5-global--primary-color--light-100: #0B5FA5;
+      --pf-v5-global--primary-color--dark-100: #0B5FA5;
+    }
+    */
+
+    /* --- Logo da prefeitura no lugar do texto "KEYCLOAK" ----------------
+       Descomente quando o arquivo logo.png for adicionado a este
+       ConfigMap (como chave "logo.png" em binaryData) e montado em
+       resources/img/logo.png no Deployment (ver keycloak.yaml).
+       Ajuste `min-height` conforme a proporção real do logo. */
+    /*
+    #kc-header-wrapper {
+      background-image: url(../img/logo.png);
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: contain;
+      min-height: 70px;
+      text-indent: -9999px;
+      overflow: hidden;
+    }
+    */
+
+# ==============================================================================
+# QUANDO O LOGO CHEGAR — passo a passo:
+#   1. Adicionar uma chave `binaryData: {"logo.png": "<base64 da imagem>"}`
+#      neste ConfigMap (gere o base64 com: `certutil -encode logo.png
+#      logo.b64` no Windows, ou `base64 -w0 logo.png` no Linux/Mac).
+#   2. Adicionar um volumeMount com subPath "logo.png" apontando para
+#      /opt/keycloak/themes/prefeitura/login/resources/img/logo.png no
+#      Deployment (ver keycloak.yaml — já tem os outros dois montados,
+#      só replicar o padrão).
+#   3. Descomentar os blocos de cor/logo acima no custom.css.
+#   4. git push — a pipeline reaplica o ConfigMap e reinicia o Keycloak
+#      automaticamente (mudança no ConfigMap montado como volume exige
+#      recriar o Pod para pegar o conteúdo novo — ver nota em keycloak.yaml
+#      sobre o rollout restart).
+# ==============================================================================
