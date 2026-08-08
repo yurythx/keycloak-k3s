@@ -138,13 +138,13 @@ spec:
               echo "   ID interno: $REALM_ID"
 
               echo ">> Verificando se o provider LDAP '$LDAP_PROVIDER_NAME' já existe neste realm..."
-              EXISTING_ID=$("$KCADM" get components -r "$TARGET_REALM" \
+              LDAP_ID=$("$KCADM" get components -r "$TARGET_REALM" \
                 -q "name=$LDAP_PROVIDER_NAME" \
                 -q "type=org.keycloak.storage.UserStorageProvider" \
-                --fields id --format csv --noquotes 2>/dev/null | tail -n +1 || true)
+                --fields id --format csv --noquotes 2>/dev/null | tail -n +1 | tr -d '\r' || true)
 
-              if [ -n "$EXISTING_ID" ]; then
-                echo "   Provider '$LDAP_PROVIDER_NAME' já existe (id=$EXISTING_ID) — pulando criação."
+              if [ -n "$LDAP_ID" ]; then
+                echo "   Provider '$LDAP_PROVIDER_NAME' já existe (id=$LDAP_ID) — pulando criação."
                 echo "   (Para reconfigurar do zero: apague pelo Admin Console e reaplique este Job.)"
               else
                 echo "   Criando provider LDAP '$LDAP_PROVIDER_NAME'..."
@@ -171,6 +171,100 @@ spec:
                   -s 'config.pagination=["true"]' \
                   -s 'config.customUserSearchFilter=["(objectCategory=person)"]'
                 echo "   Provider criado com sucesso."
+                LDAP_ID=$("$KCADM" get components -r "$TARGET_REALM" \
+                  -q "name=$LDAP_PROVIDER_NAME" \
+                  -q "type=org.keycloak.storage.UserStorageProvider" \
+                  --fields id --format csv --noquotes | tail -n +1 | tr -d '\r')
+              fi
+
+              echo ">> Verificando se o mapeador de grupos '$GROUP_MAPPER_NAME' já existe..."
+              MAPPER_ID=$("$KCADM" get components -r "$TARGET_REALM" \
+                -q "name=$GROUP_MAPPER_NAME" \
+                -q "type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper" \
+                --fields id --format csv --noquotes 2>/dev/null | tail -n +1 | tr -d '\r' || true)
+
+              if [ -n "$MAPPER_ID" ]; then
+                echo "   Mapeador '$GROUP_MAPPER_NAME' já existe (id=$MAPPER_ID) — pulando criação."
+              else
+                echo "   Criando mapeador de grupos '$GROUP_MAPPER_NAME'..."
+                "$KCADM" create components -r "$TARGET_REALM" \
+                  -s name="$GROUP_MAPPER_NAME" \
+                  -s providerId=group-ldap-mapper \
+                  -s providerType=org.keycloak.storage.ldap.mappers.LDAPStorageMapper \
+                  -s parentId="$LDAP_ID" \
+                  -s "config.\"groups.dn\"=[\"$AD_USERS_DN\"]" \
+                  -s 'config."group.name.ldap.attribute"=["cn"]' \
+                  -s 'config."group.object.classes"=["group"]' \
+                  -s 'config."membership.ldap.attribute"=["member"]' \
+                  -s 'config."membership.attribute.type"=["DN"]' \
+                  -s 'config."membership.user.ldap.attribute"=["sAMAccountName"]' \
+                  -s 'config.mode=["READ_ONLY"]' \
+                  -s 'config."user.roles.retrieve.strategy"=["LOAD_GROUPS_BY_MEMBER_ATTRIBUTE"]' \
+                  -s 'config."drop.non.existing.groups.during.sync"=["false"]' \
+                  -s 'config."preserve.group.inheritance"=["false"]' \
+                  -s 'config."ignore.missing.groups"=["true"]'
+                echo "   Mapeador criado com sucesso."
+                MAPPER_ID=$("$KCADM" get components -r "$TARGET_REALM" \
+                  -q "name=$GROUP_MAPPER_NAME" \
+                  -q "type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper" \
+                  --fields id --format csv --noquotes | tail -n +1 | tr -d '\r')
+              fi
+
+              echo ">> Sincronizando grupos do AD (rápido — só estrutura de grupos, não usuários)..."
+              "$KCADM" create "user-storage/$LDAP_ID/mappers/$MAPPER_ID/sync?direction=fedToKeycloak" -r "$TARGET_REALM" || \
+                echo "   AVISO: sync de grupos retornou erro (pode já estar sincronizado ou o AD estar temporariamente indisponível) — seguindo mesmo assim."
+              # ↑ Roda em TODO deploy, de propósito (diferente do provider/mapper, que só
+              #   são criados uma vez): mantém os grupos e memberships atualizados com o
+              #   AD a cada deploy, sem o custo de um sync completo de USUÁRIOS (milhares
+              #   de contas, minutos) — sincronizar só grupos é rápido (segundos).
+
+              CID_REALM_MGMT=$("$KCADM" get clients -r "$TARGET_REALM" \
+                -q clientId=realm-management --fields id --format csv --noquotes | tail -n +1 | tr -d '\r')
+
+              echo ">> Concedendo 'realm-admin' aos grupos administrativos do AD..."
+              IFS='|' read -ra ADMIN_GROUPS_ARRAY <<< "$ADMIN_GROUP_NAMES"
+              # ↑ Separa por "|" (pipe), não por espaço — ESSENCIAL aqui,
+              #   já que nomes de grupo do AD costumam ter espaço (ex.:
+              #   "Domain Admins", "Departamento de Tecnologia da
+              #   Informação"). Um `for X in $VAR` comum quebraria CADA
+              #   nome em várias palavras separadas pelo espaço.
+              for GROUP_NAME in "${ADMIN_GROUPS_ARRAY[@]}"; do
+                GROUP_ID=$("$KCADM" get "group-by-path/$GROUP_NAME" -r "$TARGET_REALM" --fields id --format csv --noquotes 2>/dev/null | tail -n +1 | tr -d '\r' || true)
+                if [ -z "$GROUP_ID" ]; then
+                  echo "   AVISO: grupo '$GROUP_NAME' não encontrado no realm (sync de grupos ainda não trouxe ele?) — pulando."
+                  continue
+                fi
+                HAS_ROLE=$("$KCADM" get "groups/$GROUP_ID/role-mappings/clients/$CID_REALM_MGMT" -r "$TARGET_REALM" 2>/dev/null | grep -c '"name" : "realm-admin"' || true)
+                if [ "$HAS_ROLE" -gt 0 ]; then
+                  echo "   Grupo '$GROUP_NAME' já tem 'realm-admin' — pulando."
+                else
+                  echo "   Concedendo 'realm-admin' ao grupo '$GROUP_NAME'..."
+                  "$KCADM" add-roles --gid "$GROUP_ID" --cclientid realm-management --rolename realm-admin -r "$TARGET_REALM"
+                fi
+              done
+
+              echo ">> Verificando se o usuário '$PREFEITURA_USERNAME' já existe..."
+              PREFEITURA_ID=$("$KCADM" get users -r "$TARGET_REALM" \
+                -q "username=$PREFEITURA_USERNAME" --fields id --format csv --noquotes 2>/dev/null | tail -n +1 | tr -d '\r' || true)
+
+              if [ -n "$PREFEITURA_ID" ]; then
+                echo "   Usuário '$PREFEITURA_USERNAME' já existe (id=$PREFEITURA_ID) — pulando criação/senha."
+                echo "   (A senha NÃO é resetada em execuções seguintes, de propósito — evita"
+                echo "   sobrescrever uma senha que o próprio usuário já trocou.)"
+              else
+                echo "   Criando usuário local '$PREFEITURA_USERNAME'..."
+                "$KCADM" create users -r "$TARGET_REALM" \
+                  -s username="$PREFEITURA_USERNAME" \
+                  -s enabled=true \
+                  -s emailVerified=true \
+                  -s firstName=Administração \
+                  -s lastName=Prefeitura
+                "$KCADM" set-password -r "$TARGET_REALM" \
+                  --username "$PREFEITURA_USERNAME" --new-password "$PREFEITURA_PASSWORD"
+                "$KCADM" add-roles -r "$TARGET_REALM" \
+                  --uusername "$PREFEITURA_USERNAME" --cclientid realm-management --rolename realm-admin
+                echo "   Usuário criado, senha definida (valor de PREFEITURA_ADMIN_PASSWORD"
+                echo "   em secrets.yaml) e role 'realm-admin' concedida."
               fi
 
               echo ">> Concluído."
@@ -276,6 +370,38 @@ spec:
               #   usuários dessas secretarias também, este valor precisa
               #   ser revisado (múltiplos Base DNs exigiriam múltiplos
               #   providers LDAP, um por domínio).
+
+            - name: GROUP_MAPPER_NAME
+              value: "ad-groups"
+              # ↑ Nome de exibição do mapeador de grupos dentro do Admin
+              #   Console (dentro do provider LDAP → aba Mappers).
+
+            - name: ADMIN_GROUP_NAMES
+              value: "Domain Admins|Departamento de Tecnologia da Informação"
+              # ↑ Lista de grupos do AD que recebem 'realm-admin', separados
+              #   por "|" (pipe) — NÃO por espaço/vírgula, porque nomes de
+              #   grupo do AD costumam ter espaço no meio (ambos os grupos
+              #   aqui têm). O script (ver `IFS='|' read -ra` mais acima)
+              #   já trata essa separação corretamente. Para adicionar mais
+              #   grupos no futuro, só incluir mais um "|nome do grupo".
+              #   Cada nome precisa bater EXATAMENTE com o `cn` do grupo no
+              #   AD (visto via `memberOf` de um usuário, ex.: <conta-servico-ad>).
+
+            - name: PREFEITURA_USERNAME
+              value: "prefeitura"
+              # ↑ Usuário LOCAL do Keycloak (não federado do AD) criado como
+              #   administrador do realm rondonopolis — útil como conta de
+              #   emergência caso a federação com o AD fique indisponível
+              #   (ex.: DC fora do ar), já que essa conta não depende do AD.
+
+            - name: PREFEITURA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: auth-stack-credentials
+                  key: PREFEITURA_ADMIN_PASSWORD
+              # ↑ Só é efetivamente USADA na primeira vez que o usuário é
+              #   criado (ver lógica idempotente no script) — trocar este
+              #   valor depois não reseta a senha de um usuário que já existe.
 
           resources:
             # ↑ O Job roda por segundos, uma vez (ou raramente) — recursos
