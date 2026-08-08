@@ -158,23 +158,30 @@ jobs:
         #   Secret (passo 4) para as credenciais de conexão, e é
         #   independente do Keycloak/Vaultwarden em si.
 
-      - name: 9. Aplicar Keycloak (Service headless + Deployment + Services)
+      - name: 9. Aplicar tema visual customizado do Keycloak (ConfigMap)
+        run: kubectl apply -f k3s-cluster/keycloak-theme.yaml
+        # ↑ ANTES do Deployment do Keycloak (próximo passo) de propósito:
+        #   o Deployment monta este ConfigMap como volume — se ele não
+        #   existir ainda, os Pods ficam travados em "ContainerCreating"
+        #   esperando um volume inexistente.
+
+      - name: 10. Aplicar Keycloak (Service headless + Deployment + Services)
         run: kubectl apply -f k3s-cluster/keycloak.yaml
         # ↑ Cria o Service headless (usado pelo DNS_PING para o clustering
         #   entre as 2 réplicas), o Deployment do Keycloak (já apontando
-        #   para o Postgres, garantido pronto no passo 6), o Service
-        #   ClusterIP interno E o Service LoadBalancer que expõe a porta
-        #   18443 na VM — a MESMA porta que o Keycloak antigo usava, para
-        #   o Nginx da borda não precisar de nenhuma alteração de config
-        #   (ver `nginx-edge/README.md`).
+        #   para o Postgres, garantido pronto no passo 6, e para o tema
+        #   customizado do passo anterior), o Service ClusterIP interno E
+        #   o Service LoadBalancer que expõe a porta 18443 na VM — a MESMA
+        #   porta que o Keycloak antigo usava, para o Nginx da borda não
+        #   precisar de nenhuma alteração de config (ver `nginx-edge/README.md`).
 
-      - name: 10. Aplicar Vaultwarden (PVC + Deployment + Services)
+      - name: 11. Aplicar Vaultwarden (PVC + Deployment + Services)
         run: kubectl apply -f k3s-cluster/vaultwarden.yaml
         # ↑ Mesmo raciocínio do Keycloak: inclui o Service LoadBalancer que
         #   expõe a porta 8081 na VM, a mesma porta que o Vaultwarden
         #   antigo já usava.
 
-      - name: 11. Aguardar Keycloak e Vaultwarden ficarem prontos
+      - name: 12. Aguardar Keycloak e Vaultwarden ficarem prontos
         run: |
           kubectl rollout status deployment/keycloak \
             -n authentication --timeout=300s
@@ -191,7 +198,7 @@ jobs:
         #   passo estourar o tempo — é só a CONFIRMAÇÃO da pipeline que
         #   ficaria imprecisa com um timeout curto demais).
 
-      - name: 12. Configurar federação com o Active Directory
+      - name: 13. Configurar federação com o Active Directory
         run: |
           if ! kubectl get secret ad-bind-credentials -n authentication > /dev/null 2>&1; then
             echo "AVISO: Secret 'ad-bind-credentials' ainda não existe."
@@ -219,7 +226,7 @@ jobs:
         #   interna do Job é idempotente (verifica antes de criar), então
         #   rodar de novo em todo deploy é seguro e não duplica nada.
 
-      - name: 13. Resumo final do estado do cluster
+      - name: 14. Resumo final do estado do cluster
         if: always()
         # ↑ `if: always()` faz este passo rodar SEMPRE, mesmo se algum passo
         #   anterior tiver falhado — útil para diagnóstico rápido direto

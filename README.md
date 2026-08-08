@@ -142,10 +142,11 @@ keycloak-k3s/
 │   ├── secrets.yaml                     # Credenciais (Postgres, Keycloak, Vaultwarden)
 │   ├── postgres-db.yaml                 # PVC + Deployment + Service do PostgreSQL
 │   ├── keycloak.yaml                    # Service headless + Deployment + Services (interno + porta 18443)
+│   ├── keycloak-theme.yaml              # ConfigMap: tema visual customizado (logo/cores) da prefeitura
 │   ├── vaultwarden.yaml                 # PVC + Deployment + Services (interno + porta 8081)
 │   ├── network-policy.yaml              # Restringe acesso ao Postgres só ao Keycloak
 │   ├── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
-│   └── ldap-federation-job.yaml         # Job: cria Realm "rondonopolis" + federação com o AD
+│   └── ldap-federation-job.yaml         # Job: cria Realm "rondonopolis" + federação com o AD + ativa o tema
 └── README.md                            # Este arquivo
 ```
 
