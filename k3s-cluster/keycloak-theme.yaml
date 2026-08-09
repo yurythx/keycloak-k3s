@@ -8,16 +8,15 @@
 #   uma imagem Docker customizada (o tema é injetado via ConfigMap,
 #   montado direto na imagem oficial do Keycloak).
 #
-# ⚠️ ESTADO ATUAL: ESQUELETO PRONTO, AGUARDANDO LOGO/CORES REAIS
-#   Este arquivo já deixa o mecanismo funcionando (o tema "prefeitura"
-#   já existe e já pode ser selecionado/ativado), mas ainda está
-#   visualmente IDÊNTICO ao tema padrão do Keycloak — falta:
-#     1. O arquivo do logo (`resources/img/logo.png`, ainda não incluído).
-#     2. A cor institucional real (`--pf-v5-global--primary-color--100`,
-#        ainda comentada abaixo com um valor de exemplo).
-#   Assim que esses dois itens chegarem, é só editar o CSS/adicionar a
-#   imagem aqui e dar `git push` — nenhuma mudança de infraestrutura
-#   adicional é necessária (o mecanismo de montagem já está pronto).
+# ⚠️ ESTADO ATUAL: COR REAL JÁ APLICADA — SÓ FALTA O LOGO
+#   1. Cor institucional (`#0571EE`): ✅ JÁ APLICADA — extraída de verdade
+#      do CSS/HTML de https://www.rondonopolis.mt.gov.br/, não estimada.
+#   2. Logo (`resources/img/logo.png`): ⏳ AINDA PENDENTE — o arquivo
+#      enviado no chat chegou sem conteúdo visível (imagem em branco), foi
+#      pedido reenvio. Assim que chegar, é só adicionar o `binaryData` no
+#      ConfigMap + o volumeMount em `keycloak.yaml` (passo a passo no fim
+#      deste arquivo) e dar `git push` — nenhuma mudança de infraestrutura
+#      adicional é necessária, o mecanismo de montagem já está pronto.
 #
 # COMO DESCOBRIMOS A ESTRUTURA CERTA (não foi adivinhado)
 #   O tema padrão do Keycloak 26 ("keycloak.v2") NÃO tem uma imagem de
@@ -70,18 +69,20 @@ data:
        porquê de cada seletor usado abaixo ter sido escolhido. */
 
     /* --- Cor institucional principal (botão de login, links) -----------
-       Descomente e ajuste o valor hexadecimal quando tiver a cor oficial.
-       Sobrescrevemos as 3 variantes (base, light, dark) porque o CSS do
-       PatternFly usa uma ou outra dependendo do contexto (fundo claro vs
-       escuro da página) — sobrescrever só uma deixaria a outra com a cor
-       azul padrão do Keycloak em algum estado (ex.: modo escuro do SO). */
-    /*
+       Valor REAL, não estimado: extraído direto do CSS/HTML servido por
+       https://www.rondonopolis.mt.gov.br/ (curl no HTML + nas 3 folhas de
+       estilo do site oficial, contando ocorrências de cada cor hex) —
+       #0571EE é a cor de destaque mais usada no site (22 ocorrências no
+       CSS + 7 no HTML), claramente o azul institucional. Sobrescrevemos
+       as 3 variantes (base, light, dark) porque o CSS do PatternFly usa
+       uma ou outra dependendo do contexto (fundo claro vs escuro da
+       página) — sobrescrever só uma deixaria a outra com a cor azul
+       padrão do Keycloak em algum estado (ex.: modo escuro do SO). */
     :root {
-      --pf-v5-global--primary-color--100: #0B5FA5;
-      --pf-v5-global--primary-color--light-100: #0B5FA5;
-      --pf-v5-global--primary-color--dark-100: #0B5FA5;
+      --pf-v5-global--primary-color--100: #0571EE;
+      --pf-v5-global--primary-color--light-100: #0571EE;
+      --pf-v5-global--primary-color--dark-100: #0571EE;
     }
-    */
 
     /* --- Logo da prefeitura no lugar do texto "KEYCLOAK" ----------------
        Descomente quando o arquivo logo.png for adicionado a este
