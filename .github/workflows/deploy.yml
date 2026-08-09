@@ -90,9 +90,16 @@ jobs:
     #   trafegar credenciais de acesso pela internet.
     #   (Veja o README.md para o passo a passo de registro do runner.)
 
-    timeout-minutes: 10
-    # ↑ Mata o job automaticamente se travar por mais de 10 minutos — evita
-    #   que uma pipeline "pendurada" bloqueie a fila de deploys para sempre.
+    timeout-minutes: 20
+    # ↑ Mata o job automaticamente se travar além deste tempo — evita que
+    #   uma pipeline "pendurada" bloqueie a fila de deploys para sempre.
+    #   Precisa ser MAIOR que a SOMA dos timeouts de todos os `kubectl wait`
+    #   individuais abaixo no pior caso (postgres 120s + keycloak 300s +
+    #   vaultwarden 120s + federação com o AD 300s = 840s ≈ 14min), senão
+    #   este teto geral mata a pipeline ANTES de um passo individual sequer
+    #   ter chance de reportar seu próprio erro — ajustado de 10 para 20min
+    #   quando o timeout do passo de federação subiu de 120s para 300s (ver
+    #   comentário no passo 13).
 
     steps:
       # ↑ Lista ORDENADA de passos executados sequencialmente dentro do job.
@@ -216,13 +223,27 @@ jobs:
           fi
           kubectl delete job ldap-federation-setup -n authentication --ignore-not-found
           kubectl apply -f k3s-cluster/ldap-federation-job.yaml
-          if ! kubectl wait --for=condition=complete --timeout=120s \
+          if ! kubectl wait --for=condition=complete --timeout=300s \
             job/ldap-federation-setup -n authentication; then
             echo "ERRO: o Job de federação com o AD não completou a tempo (ou falhou de verdade)."
             echo "----- Logs do Job (últimas 50 linhas) -----"
             kubectl logs -n authentication job/ldap-federation-setup --tail=50
             exit 1
           fi
+        # ↑ 🐛 `--timeout=300s` (ANTES: 120s) — bug real encontrado ao vivo
+        #   assim que o `exit 1` acima entrou em produção pela primeira vez:
+        #   o Job de federação, em execução real (sync de grupos do AD pela
+        #   rede + Keycloak ainda subindo), leva de fato ~3-4 minutos para
+        #   completar — mais que os 120s antigos. O `kubectl wait` estourava
+        #   o timeout e a pipeline falhava com "ERRO: ... não completou a
+        #   tempo", MESMO com o Job terminando com sucesso segundos depois
+        #   por conta própria. Esse timeout curto sempre existiu, mas antes
+        #   ficava mascarado pelo bug do `kubectl wait \|\| kubectl logs`
+        #   (ver linha correspondente na seção 8 do README) — corrigir um
+        #   escondia o outro. 300s alinha com o `activeDeadlineSeconds: 300`
+        #   já definido no próprio `ldap-federation-job.yaml` (o teto real
+        #   que o Job se dá antes de ser morto), então os dois números agora
+        #   contam a mesma história.
         # ↑ Este passo é TOLERANTE só a UM tipo específico de "falha": os
         #   Secrets `ad-bind-credentials` e `keycloak-admin-credentials`
         #   ainda não existirem (checado acima, com `exit 0`) — porque os
