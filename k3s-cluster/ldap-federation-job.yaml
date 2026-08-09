@@ -412,8 +412,33 @@ spec:
             - name: KC_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: auth-stack-credentials
-                  key: KC_BOOTSTRAP_ADMIN_PASSWORD
+                  name: keycloak-admin-credentials
+                  key: KC_ADMIN_PASSWORD
+              # ↑ 🐛 JÁ CAUSOU UMA QUEBRA REAL EM PRODUÇÃO — POR ISSO ESTA
+              #   VEM DE UM SECRET SEPARADO, não de `auth-stack-credentials`:
+              #   a versão anterior lia `KC_BOOTSTRAP_ADMIN_PASSWORD` direto
+              #   de `secrets.yaml` — mas esse arquivo é reaplicado pela
+              #   pipeline TODO deploy (step 4), sempre com o valor FICTÍCIO
+              #   ali dentro. O Keycloak em si ignora esse valor após o
+              #   primeiro boot (não tem problema o arquivo ficar
+              #   desatualizado), mas este Job usa e PRECISA do valor
+              #   correto TODA VEZ que roda — então, sempre que a senha real
+              #   do `kc_admin` era trocada via `kcadm` (a única forma que
+              #   funciona pós-boot), o próximo deploy reaplicava o valor
+              #   fictício por cima e quebrava a federação de novo, sem
+              #   ninguém ter mexido em nada.
+              #
+              #   `keycloak-admin-credentials` é um Secret SEPARADO, criado
+              #   manualmente (igual `ad-bind-credentials`), que NENHUM
+              #   manifesto deste repositório cria — a pipeline nunca
+              #   reaplica nem sobrescreve este valor:
+              #     kubectl create secret generic keycloak-admin-credentials \
+              #       --namespace authentication \
+              #       --from-literal=KC_ADMIN_PASSWORD='SENHA_ATUAL_DO_KC_ADMIN'
+              #   Sempre que trocar a senha do `kc_admin` via `kcadm`,
+              #   atualize TAMBÉM este Secret (kubectl create ... --dry-run=client
+              #   -o yaml | kubectl apply -f - para sobrescrever), ou o
+              #   próximo run deste Job volta a falhar na autenticação.
 
             - name: AD_BIND_DN
               valueFrom:

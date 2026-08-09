@@ -217,6 +217,7 @@ A tabela abaixo é a lista completa — não há nenhum outro valor
 | Grupos do AD com direito de admin | `ldap-federation-job.yaml` → `ADMIN_GROUP_NAMES` | `Domain Admins\|Departamento de Tecnologia da Informação` | Nomes reais de grupos **deste** AD |
 | DN da conta de bind com o AD | `secrets.yaml` → `AD_BIND_DN` | `CN=<conta-servico-ad>,OU=...,DC=rondonopolis,DC=local` | Conta e estrutura de OUs **desta** prefeitura |
 | Senha da conta de bind | Secret `ad-bind-credentials` (criado manualmente, **não** está no Git) | — | Sempre específica do ambiente, por design |
+| Senha atual do `kc_admin` (para o Job de federação) | Secret `keycloak-admin-credentials` (criado manualmente, **não** está no Git) | — | Independente do `KC_BOOTSTRAP_ADMIN_PASSWORD` de `secrets.yaml` (esse só vale no primeiro boot) — ver seção 5.6 |
 | Todas as senhas em `secrets.yaml` | `secrets.yaml` (`stringData`) | valores fictícios, claramente marcados | Devem ser geradas por ambiente — nunca reaproveitar |
 | Vhosts do Nginx de borda | `nginx-edge/*.conf` | cópia fiel dos vhosts reais desta prefeitura | Documentação/referência — **não é aplicado por este repo**; em outra rede, o Nginx (se existir) teria sua própria config, gerenciada fora deste projeto |
 | Dono/nome do repositório GitHub | `scripts/bootstrap-vm.sh` → `GH_OWNER`/`GH_REPO` | `yurythx`/`keycloak-k3s` | Já são variáveis de ambiente sobrepostas facilmente (`GH_OWNER=... GH_REPO=... ./bootstrap-vm.sh`) — não é preciso editar o script |
@@ -442,16 +443,26 @@ de atenção:
    de forma idempotente, a cada deploy) — ver seção 7.2 para o
    funcionamento completo.
 
-   Único passo manual necessário — criar, uma única vez, o Secret com a
-   senha da conta de bind (nunca commitado no Git):
+   Dois passos manuais necessários — criar, uma única vez, dois Secrets que
+   NUNCA são commitados no Git (a pipeline tolera a ausência deles: o passo
+   é pulado sem derrubar o resto do deploy, até você criá-los e rodar o
+   workflow de novo):
    ```bash
+   # 1) Senha da conta de bind com o AD:
    kubectl create secret generic ad-bind-credentials \
      --namespace authentication \
      --from-literal=AD_BIND_PASSWORD='SENHA_REAL_DA_CONTA_ADM_YURI'
+
+   # 2) Senha ATUAL do admin do Keycloak (kc_admin) — usada pelo Job para se
+   #    autenticar a cada execução. IMPORTANTE: isto é INDEPENDENTE do
+   #    KC_BOOTSTRAP_ADMIN_PASSWORD em secrets.yaml (que só vale no
+   #    primeiríssimo boot do Keycloak) — sempre que trocar a senha real do
+   #    kc_admin via kcadm (ver secrets.yaml), atualize também este Secret,
+   #    ou o Job volta a falhar na autenticação no próximo deploy:
+   kubectl create secret generic keycloak-admin-credentials \
+     --namespace authentication \
+     --from-literal=KC_ADMIN_PASSWORD='SENHA_ATUAL_DO_KC_ADMIN'
    ```
-   Sem esse Secret, o passo correspondente na pipeline é pulado
-   (não derruba o resto do deploy) — crie-o e rode o workflow de novo
-   (ou aguarde o próximo push) para ativar a federação.
 
 > 💡 **Onde testar login** (achado comum): o Admin Console padrão
 > (`/admin/master/console/`) só reconhece usuários do realm `master` —
@@ -659,6 +670,7 @@ prática. Registrar isso aqui evita repetir a mesma investigação:
 | Probes do Postgres citavam um usuário que nunca existiu | `pg_isready -U keycloak_admin` nas probes e na documentação de restore | Copiado de um ambiente de referência diferente — o usuário real (`secrets.yaml` → `POSTGRES_USER`) sempre foi `keycloak_user` | Corrigido em `postgres-db.yaml` (readiness/liveness) e no comentário de restore de `postgres-backup-cronjob.yaml`. Não derrubava as probes (`pg_isready` não valida credencial, só conectividade — confirmado ao vivo), mas quebraria um `psql -U keycloak_admin` real, copiado por alguém em uma emergência |
 | Pipeline podia "mascarar" uma falha real da federação com o AD | Passo 13 do `deploy.yml` sempre terminava em sucesso (verde), mesmo quando o Job de federação falhava de verdade (não só por Secret ausente) | `kubectl wait ... \|\| kubectl logs ...`: `kubectl logs` quase sempre funciona mesmo para um Job que falhou, então o `\|\|` "engolia" o erro | Reescrito para checar o resultado do `kubectl wait` explicitamente e `exit 1` se o Job realmente falhar — a pipeline agora fica corretamente vermelha nesse caso |
 | 🔴 **Senha fictícia do superadmin (`kc_admin`) ativa em produção por semanas** | O valor de `KC_BOOTSTRAP_ADMIN_PASSWORD` em `secrets.yaml` — literalmente escrito como placeholder, com "Tr0c4r" (trocar) no próprio valor — ainda funcionava para logar como `kc_admin` (dono de TODOS os realms), mesmo dias depois do deploy inicial | Essa variável só é lida pelo Keycloak no PRIMEIRÍSSIMO boot — depois disso, editar o arquivo e dar `git push` não muda mais nada (diferente de `POSTGRES_PASSWORD`, que É relida a cada reinício). O comentário original dizia "troque assim que logar" mas não deixava claro que editar o YAML não tem efeito nenhum para esta variável específica | Senha trocada de verdade via `kcadm.sh set-password` (o único jeito que funciona pós-boot); comentário em `secrets.yaml` reescrito explicando o mecanismo e com os comandos exatos de troca, para não se repetir |
+| 🔴 **Trocar a senha do `kc_admin` quebrava o Job de federação no deploy seguinte** | `ldap-federation-setup` passava a falhar logo após "Logging into..." — reproduzido ao vivo minutos depois de trocar a senha do `kc_admin` (ver bug acima) | O Job lia a senha do MESMO campo `KC_BOOTSTRAP_ADMIN_PASSWORD` de `secrets.yaml` para se autenticar a cada execução — mas esse arquivo é reaplicado pela pipeline em TODO deploy (step 4), sempre com o valor fictício, desfazendo qualquer troca real feita via `kcadm` | O Job agora lê a senha de um Secret SEPARADO (`keycloak-admin-credentials`), criado manualmente e nunca recriado pela pipeline — igual ao padrão já usado para `ad-bind-credentials`. `deploy.yml` (passo 13) passou a tolerar também a ausência deste novo Secret |
 
 **Padrão comum por trás da maioria destes problemas**: a imagem oficial do
 Keycloak 26 (baseada em UBI-minimal) é muito mais enxuta do que se costuma

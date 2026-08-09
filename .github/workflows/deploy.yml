@@ -207,6 +207,13 @@ jobs:
             echo "e rode este workflow novamente para ativar a federacao com o AD."
             exit 0
           fi
+          if ! kubectl get secret keycloak-admin-credentials -n authentication > /dev/null 2>&1; then
+            echo "AVISO: Secret 'keycloak-admin-credentials' ainda não existe."
+            echo "Passo pulado sem falhar o deploy do restante da stack."
+            echo "Crie-o manualmente (ver comentário de KC_ADMIN_PASSWORD em"
+            echo "k3s-cluster/ldap-federation-job.yaml) e rode este workflow de novo."
+            exit 0
+          fi
           kubectl delete job ldap-federation-setup -n authentication --ignore-not-found
           kubectl apply -f k3s-cluster/ldap-federation-job.yaml
           if ! kubectl wait --for=condition=complete --timeout=120s \
@@ -216,10 +223,11 @@ jobs:
             kubectl logs -n authentication job/ldap-federation-setup --tail=50
             exit 1
           fi
-        # ↑ Este passo é TOLERANTE só a UM tipo específico de "falha": o
-        #   Secret `ad-bind-credentials` ainda não existir (checado acima,
-        #   com `exit 0`) — porque ele depende de um passo manual único, fora
-        #   do Git (ver aviso no topo de ldap-federation-job.yaml). Depois que
+        # ↑ Este passo é TOLERANTE só a UM tipo específico de "falha": os
+        #   Secrets `ad-bind-credentials` e `keycloak-admin-credentials`
+        #   ainda não existirem (checado acima, com `exit 0`) — porque os
+        #   dois dependem de um passo manual único, fora do Git (ver aviso
+        #   no topo de ldap-federation-job.yaml). Depois que
         #   o Job É de fato criado, uma falha REAL dele (script quebrado, AD
         #   fora do ar, etc.) PRECISA derrubar este passo com `exit 1` — a
         #   versão anterior deste comando (`kubectl wait ... || kubectl logs
