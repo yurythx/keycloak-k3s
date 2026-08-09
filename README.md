@@ -632,17 +632,40 @@ real: `kubectl create job --from=cronjob/postgres-backup`, confirmando um
 arquivo `.sql.gz` de conteúdo real (não vazio) no volume persistente
 dedicado.
 
-### 7.6. Vaultwarden — hoje NÃO integrado ao Keycloak
+### 7.6. Vaultwarden — hoje NÃO integrado ao Keycloak (e não é só falta de configurar)
 
 Importante deixar explícito: o Vaultwarden está implantado **lado a lado**
 com o Keycloak (mesmo namespace, mesmo cluster, mesmo Nginx de borda),
-mas não há **nenhuma integração de login** entre os dois hoje — o
-Vaultwarden usa seu próprio sistema de contas/senhas, totalmente
-independente do Realm `rondonopolis` ou do AD. Quem for administrar ambos
-precisa de duas credenciais separadas. Vaultwarden tem suporte a login via
-OIDC/SSO nativamente (é um recurso do próprio Bitwarden/Vaultwarden), mas
-configurar o Keycloak como provedor OIDC para ele **não foi feito neste
-projeto** — é um passo futuro natural, não uma integração existente.
+mas não há **nenhuma integração de login** entre os dois — o Vaultwarden
+usa seu próprio sistema de contas/senhas, totalmente independente do Realm
+`rondonopolis` ou do AD. Quem for administrar ambos precisa de duas
+credenciais separadas.
+
+**Testado ao vivo e descartado** (não é um "próximo passo" pendente, é uma
+limitação real do software): a API do Vaultwarden expõe um campo `sso` em
+`/api/config`, o que sugeriu suporte a OpenID Connect — mas configurar
+`SSO_ENABLED`/`SSO_AUTHORITY`/`SSO_CLIENT_ID`/`SSO_CLIENT_SECRET` e
+reiniciar não teve NENHUM efeito, em duas versões testadas (a que roda em
+produção, `1.32.5`, e a mais recente disponível na época, `1.37.1`,
+testada isolada em um Pod descartável): nenhuma rota de OIDC/SSO aparece
+na lista de rotas que o próprio Vaultwarden imprime ao subir, e o campo
+`sso` continua vazio de qualquer forma. Esse campo existe só por
+compatibilidade de schema com o cliente oficial do Bitwarden — não há
+implementação de SSO no servidor do Vaultwarden self-hosted. É uma
+limitação de arquitetura do Bitwarden/Vaultwarden (o cofre é decifrado no
+cliente com a senha mestra; o fluxo completo de SSO com chave de
+decriptação separada é um recurso pago do Bitwarden Enterprise/Cloud, não
+reimplementado no Vaultwarden).
+
+Alternativas reais, se algum dia isso voltar à pauta:
+- **Proxy de pré-autenticação** (ex.: `oauth2-proxy`) na frente do
+  Vaultwarden, exigindo login no Keycloak/AD antes de sequer alcançar a
+  tela de login do Vaultwarden — não é SSO (a senha mestra do cofre
+  continua sendo digitada depois, separada), é uma camada extra de portão.
+- Manter como está — dois logins separados é, na prática, também um
+  padrão de segurança defensável para um gerenciador de senhas (evita
+  depender de uma única credencial comprometida para expor o cofre
+  inteiro).
 
 ---
 
@@ -714,8 +737,10 @@ já causou bugs reais neste projeto.
   (`keycloak-theme.yaml`), falta só o arquivo de logo e as cores
   institucionais oficiais para deixar de ser um esqueleto visualmente
   idêntico ao tema padrão.
-- **Login unificado do Vaultwarden via OIDC** contra o Keycloak (ver
-  seção 7.6) — hoje são dois sistemas de credenciais separados.
+- ~~Login unificado do Vaultwarden via OIDC~~ — **investigado e descartado**
+  (ver seção 7.6): o Vaultwarden self-hosted não tem suporte real a SSO,
+  testado ao vivo em duas versões. Decisão consciente: manter os dois
+  sistemas de credenciais separados como estão.
 - **Monitorar a validade do certificado** gerenciado pelo Nginx da borda
   (fora do escopo deste repositório, mas crítico — um certificado vencido
   ali derruba o HTTPS de toda a stack).
