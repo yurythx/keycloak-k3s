@@ -733,10 +733,11 @@ já causou bugs reais neste projeto.
   proteger contra perda física do servidor — ver limitação detalhada em
   `postgres-backup-cronjob.yaml`.
 - **MFA obrigatório** no realm do Keycloak para todos os administradores.
-- **Tema visual da prefeitura**: o mecanismo já está pronto e ativo
-  (`keycloak-theme.yaml`), falta só o arquivo de logo e as cores
-  institucionais oficiais para deixar de ser um esqueleto visualmente
-  idêntico ao tema padrão.
+- ~~Tema visual da prefeitura~~ — **concluído**: cor institucional
+  (`#0571EE`, extraída do site oficial) e logo real (brasão +
+  "PREFEITURA DE RONDONÓPOLIS", processado para PNG com transparência a
+  partir do arquivo enviado) já estão no ar, validados ao vivo — ver
+  `keycloak-theme.yaml`.
 - ~~Login unificado do Vaultwarden via OIDC~~ — **investigado e descartado**
   (ver seção 7.6): o Vaultwarden self-hosted não tem suporte real a SSO,
   testado ao vivo em duas versões. Decisão consciente: manter os dois

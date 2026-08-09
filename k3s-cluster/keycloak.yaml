@@ -409,12 +409,12 @@ spec:
             - name: theme-prefeitura
               mountPath: /opt/keycloak/themes/prefeitura/login/resources/css/custom.css
               subPath: custom.css
-            # ↑ Quando o logo.png for adicionado ao ConfigMap (ver
-            #   instruções no final de keycloak-theme.yaml), adicione aqui
-            #   mais um item seguindo o mesmo padrão:
-            #   - name: theme-prefeitura
-            #     mountPath: /opt/keycloak/themes/prefeitura/login/resources/img/logo.png
-            #     subPath: logo.png
+            - name: theme-prefeitura
+              mountPath: /opt/keycloak/themes/prefeitura/login/resources/img/logo.png
+              subPath: logo.png
+              # ↑ Logo real da prefeitura (brasão + "PREFEITURA DE
+              #   RONDONÓPOLIS"), processado para PNG com transparência —
+              #   ver histórico completo em keycloak-theme.yaml.
 
       volumes:
         - name: theme-prefeitura
