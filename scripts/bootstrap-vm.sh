@@ -93,6 +93,14 @@ GH_PAT="${GH_PAT:-}"
 # ↑ Personal Access Token opcional — se vazio, o passo 3 (runner) é pulado
 #   com instruções manuais impressas no final.
 
+RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,k3s,rondonopolis}"
+# ↑ Rótulos de exibição do runner na interface do GitHub (só organizacional
+#   — `deploy.yml` usa apenas `runs-on: self-hosted`, então nenhum destes
+#   rótulos extras precisa bater com nada para o pipeline funcionar). O
+#   valor padrão traz "rondonopolis" só por já ser o ambiente real desta
+#   implantação — em outra organização, sobrescreva com
+#   RUNNER_LABELS="self-hosted,k3s,sua-organizacao".
+
 # ------------------------------------------------------------------------------
 # Cores para deixar a saída do script mais fácil de ler nos logs
 # ------------------------------------------------------------------------------
@@ -235,7 +243,7 @@ else
       --url 'https://github.com/${GH_OWNER}/${GH_REPO}' \
       --token '${REG_TOKEN}' \
       --name '${RUNNER_NAME}' \
-      --labels 'self-hosted,k3s,rondonopolis' \
+      --labels '${RUNNER_LABELS}' \
       --work '_work'
   "
   # ↑ `--unattended`: não faz perguntas interativas (necessário em script).

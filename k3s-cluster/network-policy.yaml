@@ -108,8 +108,9 @@ spec:
           #   container eventualmente exponha.
 
 # ==============================================================================
-# COMO TESTAR SE A POLÍTICA ESTÁ SENDO REALMENTE APLICADA (após instalar um
-# CNI com enforcement de NetworkPolicy):
+# COMO TESTAR SE A POLÍTICA ESTÁ SENDO REALMENTE APLICADA (já é, por padrão,
+# neste cluster — ver nota no topo deste arquivo; o teste abaixo serve para
+# reconfirmar depois de qualquer mudança no CNI ou nos rótulos dos Pods):
 #   # Isto DEVE falhar (timeout/connection refused) — Vaultwarden não pode
 #   # falar com o Postgres:
 #   kubectl exec -n authentication deploy/vaultwarden -- \

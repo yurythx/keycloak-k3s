@@ -209,15 +209,29 @@ jobs:
           fi
           kubectl delete job ldap-federation-setup -n authentication --ignore-not-found
           kubectl apply -f k3s-cluster/ldap-federation-job.yaml
-          kubectl wait --for=condition=complete --timeout=120s \
-            job/ldap-federation-setup -n authentication || \
+          if ! kubectl wait --for=condition=complete --timeout=120s \
+            job/ldap-federation-setup -n authentication; then
+            echo "ERRO: o Job de federação com o AD não completou a tempo (ou falhou de verdade)."
+            echo "----- Logs do Job (últimas 50 linhas) -----"
             kubectl logs -n authentication job/ldap-federation-setup --tail=50
-        # ↑ Este passo é TOLERANTE A FALHA de propósito, no mesmo espírito
-        #   de outros passos opcionais desta pipeline: a federação com o AD
-        #   depende de um Secret criado manualmente uma única vez (fora do
-        #   Git — ver aviso no topo de ldap-federation-job.yaml). Sem esse
-        #   Secret, o passo é pulado (`exit 0`) em vez de derrubar o deploy
-        #   inteiro — Keycloak e Vaultwarden já estão no ar de qualquer forma.
+            exit 1
+          fi
+        # ↑ Este passo é TOLERANTE só a UM tipo específico de "falha": o
+        #   Secret `ad-bind-credentials` ainda não existir (checado acima,
+        #   com `exit 0`) — porque ele depende de um passo manual único, fora
+        #   do Git (ver aviso no topo de ldap-federation-job.yaml). Depois que
+        #   o Job É de fato criado, uma falha REAL dele (script quebrado, AD
+        #   fora do ar, etc.) PRECISA derrubar este passo com `exit 1` — a
+        #   versão anterior deste comando (`kubectl wait ... || kubectl logs
+        #   ...`) tinha um bug sutil: `kubectl logs` quase sempre funciona
+        #   mesmo para um Job que falhou, então o `||` fazia esse comando
+        #   "engolir" o erro e o passo terminava em sucesso (verde) mesmo
+        #   quando a federação com o AD estava genuinamente quebrada —
+        #   escondendo o problema tanto do painel do GitHub Actions quanto
+        #   de qualquer alerta baseado em falha de pipeline. Agora, o passo
+        #   14 (que roda sempre, via `if: always()`) ainda mostra o estado
+        #   final do cluster para diagnóstico, mas o workflow como um todo
+        #   fica corretamente marcado como FALHO quando isso acontece.
         #   `kubectl delete` antes do `apply`: Jobs do Kubernetes são
         #   IMUTÁVEIS depois de criados — sem apagar primeiro, reaplicar um
         #   Job já existente com o mesmo nome falharia. Apagar e recriar a

@@ -572,12 +572,16 @@ forma **idempotente** a cada deploy:
 - Usuário local `prefeitura` testado com login real, senha resetada e
   reconfirmada ao vivo.
 
-Pendências conhecidas (não bloqueiam o funcionamento, documentadas para
-acompanhamento): conexão ainda sem TLS (porta 389, não 636 — o DC não tem
-certificado configurado para LDAPS/StartTLS, testado diretamente com
+Pendências conhecidas: conexão ainda sem TLS (porta 389, não 636 — o DC não
+tem certificado configurado para LDAPS/StartTLS, testado diretamente com
 `openssl s_client` e `ldapsearch -ZZ`) e uso de uma conta administrativa
-(`<conta-servico-ad>`) como conta de bind, em vez de uma conta de serviço dedicada
-só leitura.
+(`<conta-servico-ad>`) como conta de bind, em vez de uma conta de serviço dedicada só
+leitura. **Esta segunda pendência já deixou de ser só teórica**: essa conta
+tem uma restrição de horário de logon configurada no próprio AD, e fora da
+janela permitida o Keycloak não consegue nem abrir a conexão LDAP — o que
+já derrubou a federação inteira (não só o login pessoal do `<conta-servico-ad>`) numa
+madrugada real de teste. Ver seção 8 para os detalhes e a seção 9 para a
+prioridade elevada de correção.
 
 ### 7.3. Nginx (borda, fora do K3s) ↔ K3s
 
@@ -650,6 +654,10 @@ prática. Registrar isso aqui evita repetir a mesma investigação:
 | Backups aparentemente OK, mas vazios | Arquivos `.sql.gz` de ~20 bytes, log dizendo "Backup concluído (4.0K)" | Dois problemas combinados: (1) o Pod do CronJob não tinha rótulo permitido pela `NetworkPolicy`, sendo bloqueado de acessar o Postgres; (2) o script usava `pg_dump \| gzip`, e em um pipe o `set -e` só vê o código de saída do ÚLTIMO comando (`gzip`), então uma falha do `pg_dump` passava despercebida | Adicionado o rótulo `app: postgres-backup` + regra correspondente na `NetworkPolicy`; script reescrito para separar `pg_dump` de `gzip` e checar o tamanho mínimo do arquivo gerado (ver commit que corrigiu isto) |
 | Suposição sobre NetworkPolicy no Flannel | Documentação afirmava que o Flannel do K3s não aplica NetworkPolicies | Suposição baseada em documentação genérica, nunca testada neste cluster específico | Testado ao vivo (par de Pods com/sem o rótulo certo tentando alcançar o Postgres) — a suposição estava **errada**: este cluster aplica a política de verdade. Documentação corrigida em todo o repositório |
 | `kubectl cp` falhando ao inspecionar o tema do Keycloak | Erro ao tentar extrair o JAR do tema de dentro do Pod | A imagem também não tem `tar`, usado internamente pelo `kubectl cp` | Extração feita com `kubectl exec ... -- cat arquivo > arquivo_local` (redirecionamento puro de stdout, funciona até para binário) |
+| **Login do AD inteiro parava de funcionar durante a madrugada** | `<conta-servico-ad>` e QUALQUER usuário do AD recebiam erro ao logar, de forma intermitente | O próprio Active Directory rejeitava a conta de bind (`<conta-servico-ad>`) com `LDAP error 49, data 530` — código padrão do Windows para "restrição de horário de logon" (`ERROR_INVALID_LOGON_HOURS`). Como essa MESMA conta é usada para toda consulta do Keycloak ao AD, o bloqueio derrubava a federação inteira, não só o login pessoal do `<conta-servico-ad>`. Reproduzido de forma independente com `ldapsearch` direto no DC (sem o Keycloak no meio) | Causa raiz fora do alcance deste repositório (é uma política do AD) — reportado ao time do AD como ação pendente (ver seção 9). Reforça a prioridade de trocar a conta de bind por uma conta de serviço dedicada, sem essa restrição |
+| Conta local `prefeitura` (break-glass) também parava de logar | `invalid_grant: "Account is not fully set up"`, mesmo com usuário/senha corretos e `requiredActions` vazio no usuário | O realm tem a ação `VERIFY_PROFILE` habilitada por padrão (comportamento de fábrica do Keycloak 26) — o usuário `prefeitura` era criado sem e-mail, e essa ação é recalculada dinamicamente a cada login (não fica salva na lista de ações pendentes do usuário) | `ldap-federation-job.yaml` agora define um e-mail (`PREFEITURA_EMAIL`) na criação do usuário, e reforça isso em TODO deploy (idempotente) — corrige automaticamente qualquer cluster que já tenha rodado uma versão anterior deste Job |
+| Probes do Postgres citavam um usuário que nunca existiu | `pg_isready -U keycloak_admin` nas probes e na documentação de restore | Copiado de um ambiente de referência diferente — o usuário real (`secrets.yaml` → `POSTGRES_USER`) sempre foi `keycloak_user` | Corrigido em `postgres-db.yaml` (readiness/liveness) e no comentário de restore de `postgres-backup-cronjob.yaml`. Não derrubava as probes (`pg_isready` não valida credencial, só conectividade — confirmado ao vivo), mas quebraria um `psql -U keycloak_admin` real, copiado por alguém em uma emergência |
+| Pipeline podia "mascarar" uma falha real da federação com o AD | Passo 13 do `deploy.yml` sempre terminava em sucesso (verde), mesmo quando o Job de federação falhava de verdade (não só por Secret ausente) | `kubectl wait ... \|\| kubectl logs ...`: `kubectl logs` quase sempre funciona mesmo para um Job que falhou, então o `\|\|` "engolia" o erro | Reescrito para checar o resultado do `kubectl wait` explicitamente e `exit 1` se o Job realmente falhar — a pipeline agora fica corretamente vermelha nesse caso |
 
 **Padrão comum por trás da maioria destes problemas**: a imagem oficial do
 Keycloak 26 (baseada em UBI-minimal) é muito mais enxuta do que se costuma
@@ -670,9 +678,16 @@ já causou bugs reais neste projeto.
   configurado para o serviço LDAP — pedir ao time que administra o AD
   para configurar isso, e então trocar a URL de conexão para
   `ldaps://192.168.0.101:636`.
-- **Conta de bind dedicada para o AD**: hoje usa uma conta administrativa
-  (`<conta-servico-ad>`) por conveniência — trocar por uma conta de serviço só
-  leitura assim que possível (ver seção 5.6).
+- **🔴 PRIORIDADE ELEVADA — Conta de bind dedicada para o AD**: hoje usa uma
+  conta administrativa (`<conta-servico-ad>`) por conveniência. Isso deixou de ser só
+  uma recomendação de boas práticas: já causamos uma indisponibilidade REAL
+  do login inteiro do realm `rondonopolis` porque essa conta tem uma
+  restrição de horário de logon no AD (`data 530` / `ERROR_INVALID_LOGON_HOURS`)
+  — fora da janela permitida, o Keycloak não consegue nem abrir a conexão
+  LDAP, e NINGUÉM do AD consegue logar (ver seção 8). Ação recomendada:
+  pedir ao time do AD uma conta de serviço dedicada, só leitura, SEM
+  restrição de horário — depois trocar `AD_BIND_DN` em `secrets.yaml` e
+  recriar o Secret `ad-bind-credentials` com a senha da nova conta.
 - **Sealed Secrets / SOPS**: para versionar segredos criptografados no Git
   em vez de texto plano (ver aviso detalhado em `secrets.yaml`).
 - **Backup off-site**: o CronJob já grava backups diários no disco da VM

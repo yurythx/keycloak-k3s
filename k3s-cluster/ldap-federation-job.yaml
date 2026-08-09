@@ -309,6 +309,7 @@ spec:
                 "$KCADM" create users -r "$TARGET_REALM" \
                   -s username="$PREFEITURA_USERNAME" \
                   -s enabled=true \
+                  -s email="$PREFEITURA_EMAIL" \
                   -s emailVerified=true \
                   -s firstName=Administração \
                   -s lastName=Prefeitura
@@ -318,7 +319,32 @@ spec:
                   --uusername "$PREFEITURA_USERNAME" --cclientid realm-management --rolename realm-admin
                 echo "   Usuário criado, senha definida (valor de PREFEITURA_ADMIN_PASSWORD"
                 echo "   em secrets.yaml) e role 'realm-admin' concedida."
+                PREFEITURA_ID=$("$KCADM" get users -r "$TARGET_REALM" \
+                  -q "username=$PREFEITURA_USERNAME" --fields id,username --format csv --noquotes 2>/dev/null \
+                  | tr -d '\r' | find_id_by_exact_name "$PREFEITURA_USERNAME" || true)
               fi
+
+              echo ">> Garantindo que '$PREFEITURA_USERNAME' tem e-mail cadastrado (evita bug real já"
+              echo "   encontrado em produção — ver explicação abaixo)..."
+              "$KCADM" update "users/$PREFEITURA_ID" -r "$TARGET_REALM" \
+                -s email="$PREFEITURA_EMAIL" -s emailVerified=true
+              # ↑ 🐛 BUG REAL JÁ ENCONTRADO E CORRIGIDO: o realm "rondonopolis"
+              #   tem a ação obrigatória "VERIFY_PROFILE" habilitada por
+              #   padrão (comportamento de fábrica do Keycloak 26 — não fomos
+              #   nós que ativamos). Sem um e-mail cadastrado, TODA tentativa
+              #   de login do usuário "prefeitura" — inclusive pela API,
+              #   inclusive pelo Admin Console — falhava com
+              #   "invalid_grant: Account is not fully set up", mesmo com
+              #   usuário/senha corretos e `requiredActions` vazio (a
+              #   verificação de perfil é calculada dinamicamente a cada
+              #   login, não fica guardada na lista de ações pendentes do
+              #   usuário). Isso é especialmente grave porque "prefeitura" é
+              #   justamente a conta de emergência que deveria funcionar
+              #   mesmo com o AD fora do ar — sem este `update`, ela ficava
+              #   tão inutilizável quanto o login federado. Roda em TODO
+              #   deploy (idempotente: sempre define o mesmo valor) para
+              #   também corrigir automaticamente qualquer cluster que já
+              #   tenha rodado uma versão anterior deste Job sem esta linha.
 
               echo ">> Ativando o tema visual 'prefeitura' na tela de login do realm..."
               "$KCADM" update "realms/$TARGET_REALM" -s loginTheme=prefeitura
@@ -466,6 +492,17 @@ spec:
               # ↑ Só é efetivamente USADA na primeira vez que o usuário é
               #   criado (ver lógica idempotente no script) — trocar este
               #   valor depois não reseta a senha de um usuário que já existe.
+
+            - name: PREFEITURA_EMAIL
+              value: "prefeitura@rondonopolis.mt.gov.br"
+              # ↑ Necessário porque o realm tem a ação "VERIFY_PROFILE"
+              #   habilitada por padrão (de fábrica do Keycloak 26) — sem
+              #   e-mail cadastrado, o login deste usuário falha com
+              #   "Account is not fully set up" (bug real já encontrado e
+              #   corrigido em produção — ver comentário completo mais abaixo,
+              #   onde este valor é aplicado). Não precisa ser uma caixa de
+              #   e-mail que realmente receba mensagens — só precisa passar
+              #   na validação de formato do perfil do usuário.
 
           resources:
             # ↑ O Job roda por segundos, uma vez (ou raramente) — recursos

@@ -292,16 +292,18 @@ spec:
 
 # ==============================================================================
 # COMO RESTAURAR UM BACKUP MANUALMENTE (procedimento de emergência):
-#   1. Liste os backups disponíveis:
-#        kubectl exec -n authentication deploy/postgres -- \
-#          sh -c "ls -lh /backups" 2>/dev/null || \
+#   1. Liste os backups disponíveis — o Pod do Postgres NÃO monta este PVC de
+#      backup (só o CronJob monta), então é preciso um Pod auxiliar temporário:
 #        kubectl run -n authentication restore-helper --rm -it \
 #          --image=postgres:16-alpine --restart=Never \
 #          --overrides='{"spec":{"containers":[{"name":"restore-helper","image":"postgres:16-alpine","command":["sh"],"stdin":true,"tty":true,"volumeMounts":[{"name":"b","mountPath":"/backups"}]}],"volumes":[{"name":"b","persistentVolumeClaim":{"claimName":"postgres-backup-pvc"}}]}}'
+#      Dentro do shell aberto: ls -lh /backups
 #   2. Copie o arquivo desejado para fora do cluster, se necessário:
 #        kubectl cp authentication/<pod-com-volume-montado>:/backups/keycloak_XXXXXXXX.sql.gz ./backup-local.sql.gz
-#   3. Restaure no banco (ATENÇÃO: sobrescreve dados existentes):
+#   3. Restaure no banco (ATENÇÃO: sobrescreve dados existentes) — use o
+#      MESMO usuário configurado em secrets.yaml (POSTGRES_USER, hoje
+#      "keycloak_user" — NÃO "keycloak_admin", que nunca existiu):
 #        gunzip -c backup-local.sql.gz | \
 #          kubectl exec -i -n authentication deploy/postgres -- \
-#          psql -U keycloak_admin -d keycloak
+#          psql -U keycloak_user -d keycloak
 # ==============================================================================

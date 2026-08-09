@@ -168,10 +168,22 @@ spec:
             #   Enquanto a resposta for "não", o Service não envia requisições
             #   para ele (evita erros de conexão durante o boot do banco).
             exec:
-              command: ["pg_isready", "-U", "keycloak_admin", "-d", "keycloak"]
+              command: ["pg_isready", "-U", "keycloak_user", "-d", "keycloak"]
               # ↑ `pg_isready` é um utilitário oficial do Postgres que
               #   verifica se o servidor está aceitando conexões — muito mais
               #   confiável do que apenas checar se a porta 5432 está aberta.
+              #   ⚠️ CORRIGIDO: usava "keycloak_admin", um usuário que NUNCA
+              #   existiu (o usuário real, definido em secrets.yaml, é
+              #   "keycloak_user"). Isso não quebrava a probe em si — o
+              #   `pg_isready` só verifica se o servidor RESPONDE, sem
+              #   validar credencial nenhuma (confirmado ao vivo: mesmo
+              #   `-U` com um usuário inexistente retorna "accepting
+              #   connections") — mas era uma armadilha real para qualquer
+              #   pessoa que copiasse este comando esperando uma conta
+              #   válida (`psql -U keycloak_admin` falha de verdade com
+              #   "role does not exist"). Se o valor de POSTGRES_USER em
+              #   secrets.yaml mudar um dia, atualize aqui também (as
+              #   probes não conseguem ler o Secret diretamente).
             initialDelaySeconds: 10
             # ↑ Espera 10s após o container subir antes da PRIMEIRA checagem
             #   (dá tempo do Postgres inicializar o banco na primeira vez).
@@ -183,7 +195,8 @@ spec:
             #   repetidamente, o Kubernetes MATA e RECRIA o container
             #   (autocura de travamentos internos).
             exec:
-              command: ["pg_isready", "-U", "keycloak_admin", "-d", "keycloak"]
+              command: ["pg_isready", "-U", "keycloak_user", "-d", "keycloak"]
+              # ↑ Mesma correção da readinessProbe acima (ver comentário lá).
             initialDelaySeconds: 30
             # ↑ Prazo maior que o readiness, para não matar o container à toa
             #   enquanto ele ainda está subindo pela primeira vez.
