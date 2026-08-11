@@ -1,0 +1,77 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/resource-quota.yaml
+# ------------------------------------------------------------------------------
+# 🔒 ARQUIVO NOVO — criado em auditoria de segurança (ago/2026)
+#
+# OBJETIVO
+#   Cada container desta stack já declara `resources.requests/limits`
+#   individualmente (ver `keycloak.yaml`, `postgres-db.yaml`,
+#   `vaultwarden.yaml`) — mas nada, até agora, impedia um workload FUTURO
+#   (ex.: um teste esquecido, um Pod de diagnóstico que ninguém apagou) de
+#   ser criado no namespace `authentication` SEM nenhum limite,
+#   consumindo a VM inteira de 8GB e derrubando o login da prefeitura
+#   inteira por inanição de recursos (não por um bug no Keycloak em si).
+#
+#   1. ResourceQuota -> teto agregado de CPU/RAM para TODO o namespace.
+#   2. LimitRange     -> se um novo container for criado SEM declarar
+#      `resources` (esquecimento humano), aplica um valor padrão sensato
+#      automaticamente, em vez de deixá-lo sem limite nenhum.
+#
+# COMO O TETO FOI CALCULADO (headroom para rolling update + Jobs)
+#   Consumo "de regime" (steady-state) desta stack, somando os requests
+#   já declarados: Keycloak 2×(300m/600Mi) + Postgres (100m/256Mi) +
+#   Vaultwarden (50m/64Mi) ≈ 750m CPU / 1.520Mi RAM. O teto abaixo dá
+#   margem generosa para: (a) o `maxSurge: 1` do rollout do Keycloak (mais
+#   1 réplica temporária durante deploys), (b) o CronJob de backup do
+#   Postgres/Vaultwarden e o Job de federação com o AD rodando ao mesmo
+#   tempo (raro, mas possível), sem chegar nem perto do limite físico de
+#   8GB da VM (ver seção 2 do README).
+# ==============================================================================
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: authentication-quota
+  namespace: authentication
+
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: "3Gi"
+    limits.cpu: "4"
+    limits.memory: "5Gi"
+    pods: "20"
+    # ↑ Teto de quantidade de Pods simultâneos no namespace — segunda
+    #   rede de segurança independente da CPU/RAM (evita, por exemplo, um
+    #   CronJob mal configurado disparando dezenas de Jobs em loop).
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: authentication-default-limits
+  namespace: authentication
+
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: "50m"
+        memory: "64Mi"
+        # ↑ Aplicado automaticamente a qualquer container NOVO que não
+        #   declare `resources.requests` explicitamente — o menor valor já
+        #   usado por um container real desta stack (Vaultwarden), uma
+        #   base sensata mas nunca ausente.
+      default:
+        cpu: "500m"
+        memory: "256Mi"
+        # ↑ Mesma ideia para `resources.limits` — teto padrão moderado
+        #   (igual ao já usado nos Jobs de backup/federação) para qualquer
+        #   container que "esqueça" de declarar o próprio teto.
+      max:
+        cpu: "1500m"
+        memory: "2Gi"
+        # ↑ Nenhum container individual pode pedir/usar mais que isto,
+        #   nem que declare explicitamente — protege contra um valor
+        #   digitado errado (ex.: "2000Mi" vs "2000m") consumindo a VM
+        #   inteira sozinho.
