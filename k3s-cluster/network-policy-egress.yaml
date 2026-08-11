@@ -1,0 +1,242 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/network-policy-egress.yaml
+# ------------------------------------------------------------------------------
+# 🔒 ARQUIVO NOVO — criado em auditoria de segurança (ago/2026)
+#
+# OBJETIVO
+#   `network-policy.yaml` (já existente) só restringe tráfego de ENTRADA
+#   (quem pode CONECTAR NO Postgres). Nada, até esta auditoria, restringia
+#   tráfego de SAÍDA — ou seja, um Pod comprometido (Keycloak, Vaultwarden,
+#   ou qualquer workload futuro) podia abrir conexão de saída para
+#   QUALQUER IP da internet, sem limite nenhum. Isto adiciona uma segunda
+#   camada de defesa em profundidade: cada Pod só pode iniciar conexão
+#   para o que ele genuinamente precisa, mais nada.
+#
+# ⚠️ RISCO DESTA MUDANÇA (leia antes de tocar neste arquivo)
+#   Assim que QUALQUER NetworkPolicy com `policyTypes: [Egress]` é aplicada
+#   a um Pod, o comportamento padrão vira "negar toda saída que não
+#   estiver listada aqui" — incluindo a resolução de DNS. Esquecer a regra
+#   de DNS quebra a stack inteira de forma sutil e confusa (Pods sobem,
+#   ficam Ready, mas falham ao resolver qualquer hostname). Por isso TODA
+#   regra abaixo libera DNS explicitamente antes de qualquer outra coisa.
+#   Testado ao vivo após aplicar: login no Keycloak, sincronização com o AD
+#   (Job de federação) e o endpoint /alive do Vaultwarden, todos
+#   continuaram funcionando (ver registro de validação na seção 8 do
+#   README).
+#
+# RESUMO DO QUE CADA GRUPO DE PODS PODE INICIAR (egress):
+#   app: keycloak         -> DNS, Postgres (5432), outros Pods keycloak
+#                             (7800/jgroups), AD DC 192.168.0.101 (389/636)
+#   app: postgres          -> só DNS (nunca inicia conexão nenhuma de verdade)
+#   app: vaultwarden       -> só DNS (sem SMTP configurado hoje — se um dia
+#                             configurarem SMTP_HOST, adicione uma regra aqui)
+#   app: postgres-backup   -> DNS + Postgres (5432)
+#   app: vaultwarden-backup -> NENHUMA (só lê o volume local, nunca fala
+#                             com a rede) — Egress totalmente bloqueado.
+#   app: ldap-federation   -> DNS + Keycloak (8080) + AD DC (389/636)
+# ==============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-egress
+  namespace: authentication
+spec:
+  podSelector:
+    matchLabels:
+      app: keycloak
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      # ↑ DNS — SEMPRE a primeira regra (ver aviso no cabeçalho).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+      ports:
+        - protocol: TCP
+          port: 7800
+      # ↑ JGroups/DNS_PING entre as 2 réplicas (cache distribuído — ver
+      #   keycloak.yaml).
+    - to:
+        - ipBlock:
+            cidr: 192.168.0.101/32
+      ports:
+        - protocol: TCP
+          port: 389
+        - protocol: TCP
+          port: 636
+      # ↑ Domain Controller do AD — 389 (LDAP, em uso hoje) e 636 (LDAPS,
+      #   já liberado aqui para quando a pendência de certificado no DC
+      #   for resolvida — ver seção 9 do README — sem precisar editar esta
+      #   policy de novo naquele dia).
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-egress
+  namespace: authentication
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      # ↑ O Postgres nunca inicia conexão de saída de verdade — liberamos
+      #   só DNS por higiene/compatibilidade (ex.: alguma extensão futura
+      #   que resolva hostname). Todo o resto de saída fica bloqueado.
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vaultwarden-egress
+  namespace: authentication
+spec:
+  podSelector:
+    matchLabels:
+      app: vaultwarden
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      # ↑ Hoje o Vaultwarden não tem SMTP configurado (sem
+      #   SMTP_HOST/SMTP_PORT em vaultwarden.yaml), então não precisa de
+      #   mais nenhuma saída além de DNS. Se um dia configurarem envio de
+      #   e-mail (convites/recuperação), adicione uma regra de Egress aqui
+      #   apontando para o servidor SMTP usado — sem isso, os e-mails
+      #   falhariam silenciosamente com esta policy no lugar.
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-backup-egress
+  namespace: authentication
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres-backup
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vaultwarden-backup-egress
+  namespace: authentication
+spec:
+  podSelector:
+    matchLabels:
+      app: vaultwarden-backup
+  policyTypes:
+    - Egress
+  egress: []
+  # ↑ Lista vazia = bloqueia TODA saída, inclusive DNS. De propósito: este
+  #   Job só faz `tar` de um volume local montado (ver
+  #   vaultwarden-backup-cronjob.yaml) — nunca abre conexão de rede
+  #   nenhuma, nem para resolver hostname.
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ldap-federation-egress
+  namespace: authentication
+spec:
+  podSelector:
+    matchLabels:
+      app: ldap-federation
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+      ports:
+        - protocol: TCP
+          port: 8080
+      # ↑ O Job se autentica no Keycloak via `kcadm.sh` (porta 8080,
+      #   interna — ver ldap-federation-job.yaml).
+    - to:
+        - ipBlock:
+            cidr: 192.168.0.101/32
+      ports:
+        - protocol: TCP
+          port: 389
+        - protocol: TCP
+          port: 636
+
+# ==============================================================================
+# COMO TESTAR (mesmo espírito do teste documentado em network-policy.yaml):
+#   # DEVE funcionar — Keycloak resolvendo DNS e falando com o Postgres:
+#   kubectl exec -n authentication deploy/keycloak -- nc -zv postgres 5432
+#
+#   # DEVE falhar — Vaultwarden tentando iniciar conexão pra fora que não
+#   # seja DNS (ex.: um IP qualquer da internet):
+#   kubectl exec -n authentication deploy/vaultwarden -- \
+#     wget -qO- --timeout=5 http://1.1.1.1 || echo "Bloqueado como esperado"
+# ==============================================================================
