@@ -63,9 +63,10 @@ spec:
   #   os dados intactos, recuperável manualmente). Os PVCs mais antigos
   #   (`postgres-pvc`, `postgres-backup-pvc`, `vaultwarden-pvc`) não podem
   #   trocar de StorageClass depois de criados (campo imutável) — para
-  #   eles, a mesma proteção foi aplicada diretamente no objeto
+  #   eles, a mesma proteção deve ser aplicada diretamente no objeto
   #   PersistentVolume já existente (`kubectl patch pv ... Retain`), fora
-  #   deste arquivo — ver runbook na seção 8 do README.
+  #   deste arquivo. ⏳ PENDENTE (ago/2026): recomendado nesta auditoria,
+  #   ainda não aplicado — ver seção 9 do README para o comando exato.
 
   resources:
     requests:

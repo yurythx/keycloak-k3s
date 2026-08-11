@@ -1,5 +1,20 @@
 # Nginx da borda (aaPanel/BT Panel) — ZERO alterações necessárias
 
+> 🔒 **Duas pendências de segurança identificadas em auditoria (ago/2026),
+> ainda NÃO aplicadas neste servidor** (fora do alcance deste repositório
+> — ver seção 9.1 do `README.md` principal para o diff exato):
+> 1. `sso.rondonopolis.mt.gov.br.conf` não força HTTPS (falta o bloco
+>    `HTTP_TO_HTTPS` que `cofre.rondonopolis.mt.gov.br.conf` já tem) —
+>    login/token do Keycloak pode trafegar em texto puro na porta 80.
+> 2. `ssl_protocols` inclui `TLSv1.1` (depreciado desde 2021) e
+>    `ssl_ciphers` inclui `3DES` (vulnerável a SWEET32), em ambos os
+>    vhosts.
+>
+> Os arquivos `.conf` nesta pasta são cópias de referência do que está
+> rodando de verdade — atualize-os aqui TAMBÉM depois de aplicar a
+> correção no aaPanel, para não ficarem desatualizados em relação ao
+> servidor real.
+
 Esta pasta **não é aplicada no cluster K3s**. O Nginx da borda (IP
 `192.168.0.218`) é um servidor separado, já existente e já configurado —
 os arquivos aqui são cópias EXATAS, sem modificação, dos vhosts reais que

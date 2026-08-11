@@ -17,7 +17,12 @@ exatamente o que foi validado, como, e que evidência prova que funciona.
 | **Keycloak 26 (Quarkus)** | Identity Provider (SSO, OIDC/SAML) para os sistemas da prefeitura, com federação de ~7.600 usuários reais do Active Directory | 2 (alta disponibilidade, cluster via DNS_PING) | `sso.rondonopolis.mt.gov.br` | `18443` |
 | **PostgreSQL 16-alpine** | Banco de dados persistente do Keycloak (realms, usuários, sessões) | 1 | (interno, sem acesso externo) | — |
 | **Vaultwarden** | Cofre de senhas (compatível com Bitwarden) para as equipes de TI/administração — hoje **não integrado** ao Keycloak (login próprio, separado — ver seção 7.6) | 1 | `cofre.rondonopolis.mt.gov.br` | `8081` |
+| **Portainer CE** | Painel de controle/observabilidade do próprio cluster K3s (uso interno da equipe de TI, não é parte do fluxo de autenticação) | 1 | — (só LAN, ver `portainer.yaml`) | `30779` (HTTPS) |
 | **Nginx (fora do K3s)** | Servidor de borda **já existente** na rede da prefeitura — termina o HTTPS público | — | recebe os 2 domínios acima | 80/443 |
+
+> 🔒 Versões de imagem atualizadas em auditoria de segurança (ago/2026):
+> Keycloak `26.0` → `26.7.0`, Vaultwarden `1.32.5` → `1.37.1` (corrigia 9
+> CVEs de severidade média já publicadas). Ver seção 8.
 
 Este repositório já está **100% pronto para ser aplicado na VM assim que
 ela existir** — os domínios reais, o clustering do Keycloak, a federação
@@ -35,6 +40,8 @@ configurados nos manifestos. O que falta é só a parte física (seção 5).
 7. [Integrações — o que conecta com o quê, e como foi validado](#7-integrações--o-que-conecta-com-o-quê-e-como-foi-validado)
 8. [Problemas reais já encontrados e corrigidos](#8-problemas-reais-já-encontrados-e-corrigidos)
 9. [Próximos passos recomendados](#9-próximos-passos-recomendados)
+   - [9.1. Pendências da auditoria de ago/2026 (bloqueadas nesta sessão)](#91-pendências-da-auditoria-de-segurança-de-ago2026-que-não-puderam-ser-aplicadas-nesta-sessão)
+   - [9.2. Demais recomendações](#92-demais-recomendações)
 
 ---
 
@@ -124,6 +131,10 @@ ao vivo no cluster real que esta restrição é de fato aplicada pelo CNI
 Rondonópolis-MT), compacta o resultado e mantém os últimos 7 dias
 automaticamente, em um disco separado do disco de dados (ver limitação
 sobre backup off-site em `k3s-cluster/postgres-backup-cronjob.yaml`).
+🔒 Desde a auditoria de ago/2026, o Vaultwarden (cofre de senhas) também
+tem backup diário próprio (`vaultwarden-backup-cronjob.yaml`, 03:15,
+mesma política de retenção de 7 dias) — antes disso, só o Postgres/
+Keycloak tinha backup automatizado.
 
 **Federação com o Active Directory:** o Keycloak não gerencia usuários
 manualmente — ele consulta o AD da prefeitura (`rondonopolis.local`) em
@@ -140,9 +151,17 @@ separado do `master`). Ver seção 7.2 para o detalhamento completo.
 | PostgreSQL | 256Mi | 512Mi |
 | Keycloak (× 2 réplicas) | 600Mi cada (1200Mi total) | 1024Mi cada (2048Mi total) |
 | Vaultwarden | 64Mi | 128Mi |
-| Backup CronJob (só durante a execução diária, ~1 min/dia) | 64Mi | 256Mi |
-| Traefik (já incluso no K3s, usado só internamente) | ~50Mi | — |
-| **Total aproximado no pior caso (limits)** | | **~3,5 GiB** |
+| Backup CronJob do Postgres (só durante a execução diária, ~1 min/dia) | 64Mi | 256Mi |
+| Backup CronJob do Vaultwarden 🔒 (idem, ~15min depois do backup do Postgres) | 64Mi | 256Mi |
+| Portainer 🔒 (painel de controle do cluster, fora do namespace `authentication`) | 128Mi | 512Mi |
+| Traefik (já incluso no K3s; o Service dele foi convertido para `ClusterIP` — ver seção 8 — não ocupa mais portas na VM) | ~50Mi | — |
+| **Total aproximado no pior caso (limits)** | | **~4,1 GiB** |
+
+> 🔒 Um `ResourceQuota`+`LimitRange` (`k3s-cluster/resource-quota.yaml`,
+> auditoria ago/2026) agora impõe um teto agregado real sobre o
+> namespace `authentication` (2 vCPU/3Gi de requests, 4 vCPU/5Gi de
+> limits) — os números da tabela acima são o esperado em regime, não um
+> teto imposto por si só antes disso.
 
 Isso deixa **mais de 4GB de RAM livres** na VM de 8GB para picos de tráfego,
 cache de disco do sistema operacional e crescimento futuro — uma margem de
@@ -174,16 +193,24 @@ keycloak-k3s/
 │   └── cofre.rondonopolis.mt.gov.br.conf
 ├── k3s-cluster/
 │   ├── namespaces.yaml                  # Namespace "authentication"
+│   ├── storageclass.yaml                # 🔒 StorageClass local-path-retain (reclaimPolicy: Retain)
+│   ├── resource-quota.yaml              # 🔒 ResourceQuota + LimitRange do namespace authentication
 │   ├── secrets.yaml                     # Credenciais (Postgres, Keycloak, Vaultwarden, AD)
 │   ├── postgres-db.yaml                 # PVC + Deployment + Service do PostgreSQL
-│   ├── keycloak.yaml                    # Service headless + Deployment + Services (interno + porta 18443) + tema
-│   ├── keycloak-theme.yaml              # ConfigMap: tema visual customizado (logo/cores) da prefeitura
-│   ├── vaultwarden.yaml                 # PVC + Deployment + Services (interno + porta 8081)
-│   ├── network-policy.yaml              # Restringe acesso ao Postgres só ao Keycloak + backup
+│   ├── network-policy.yaml              # Restringe INGRESS ao Postgres só ao Keycloak + backup
+│   ├── network-policy-egress.yaml       # 🔒 Restringe EGRESS de cada workload (Keycloak/Postgres/Vaultwarden/Jobs)
 │   ├── postgres-backup-cronjob.yaml     # PVC + CronJob de backup diário do banco
-│   └── ldap-federation-job.yaml         # Job: cria Realm "rondonopolis" + federação com o AD + admins + tema
+│   ├── keycloak-theme.yaml              # ConfigMap: tema visual customizado (logo/cores) da prefeitura
+│   ├── keycloak.yaml                    # Service headless + Deployment + Services (interno + porta 18443) + tema
+│   ├── vaultwarden.yaml                 # PVC + Deployment + Services (interno + porta 8081)
+│   ├── vaultwarden-backup-cronjob.yaml  # 🔒 PVC + CronJob de backup diário do cofre de senhas
+│   ├── ldap-federation-job.yaml         # Job: cria Realm "rondonopolis" + federação com o AD + admins + tema
+│   └── portainer.yaml                   # 🔒 Painel de controle do cluster (namespace/RBAC/Deployment próprios)
 └── README.md                            # Este arquivo
 ```
+
+> 🔒 Itens marcados adicionados em auditoria de segurança (ago/2026) —
+> ver seção 8 para o que cada um resolve e como foi testado.
 
 Cada arquivo `.yaml`/`.sh`/`.conf` tem comentários explicando **linha a
 linha** o que cada parâmetro faz e, sempre que uma decisão não era óbvia,
@@ -211,7 +238,7 @@ A tabela abaixo é a lista completa — não há nenhum outro valor
 | Hostname público do Vaultwarden | `vaultwarden.yaml` → `DOMAIN` | `https://cofre.rondonopolis.mt.gov.br` | Domínio real desta prefeitura |
 | Porta legada do Keycloak | `keycloak.yaml` → Service `keycloak-external` | `18443` | Porta que o Nginx **desta** rede já espera (ver 4.2) |
 | Porta legada do Vaultwarden | `vaultwarden.yaml` → Service `vaultwarden-external` | `8081` | Idem |
-| Endereço do Domain Controller | `ldap-federation-job.yaml` → `AD_CONNECTION_URL` | `ldap://192.168.0.101:389` | IP do AD **desta** rede |
+| Endereço do Domain Controller | `ldap-federation-job.yaml` → `AD_CONNECTION_URL`, e `network-policy-egress.yaml` → `ipBlock.cidr` (2 lugares, ambos usados pela egress do Keycloak e do Job de federação) | `ldap://192.168.0.101:389` | IP do AD **desta** rede |
 | Base DN dos usuários no AD | `ldap-federation-job.yaml` → `AD_USERS_DN` | `DC=rondonopolis,DC=local` | Estrutura do domínio AD **desta** prefeitura |
 | Nome do Realm de destino | `ldap-federation-job.yaml` → `TARGET_REALM` | `rondonopolis` | Escolha de nome, livre para trocar |
 | Grupos do AD com direito de admin | `ldap-federation-job.yaml` → `ADMIN_GROUP_NAMES` | `Domain Admins\|Departamento de Tecnologia da Informação` | Nomes reais de grupos **deste** AD |
@@ -522,7 +549,8 @@ extra de configuração de borda.
 | Ver logs do Postgres | `kubectl logs -n authentication deploy/postgres -f` |
 | Reiniciar o Keycloak (após trocar segredo) | `kubectl rollout restart deployment/keycloak -n authentication` |
 | Ver backups disponíveis | `kubectl run -n authentication ls-backups --rm -it --image=busybox --restart=Never --overrides='{"spec":{"containers":[{"name":"ls-backups","image":"busybox","command":["ls","-lh","/backups"],"volumeMounts":[{"name":"b","mountPath":"/backups"}]}],"volumes":[{"name":"b","persistentVolumeClaim":{"claimName":"postgres-backup-pvc"}}]}}'` |
-| Forçar um backup fora do horário agendado | `kubectl create job -n authentication backup-manual --from=cronjob/postgres-backup` |
+| Forçar um backup do Postgres fora do horário agendado | `kubectl create job -n authentication backup-manual --from=cronjob/postgres-backup` |
+| Forçar um backup do Vaultwarden fora do horário agendado 🔒 | `kubectl create job -n authentication vw-backup-manual --from=cronjob/vaultwarden-backup` |
 | Ver uso de RAM/CPU real dos Pods | `kubectl top pods -n authentication` |
 | Testar as portas legadas sem depender do Nginx | `curl -I http://IP_DA_VM:18443/` e `curl -I http://IP_DA_VM:8081/` |
 | Forçar reaplicação dos manifestos | Aba **Actions** → workflow **Deploy Auth Stack para o K3s** → **Run workflow** |
@@ -673,7 +701,13 @@ Alternativas reais, se algum dia isso voltar à pauta:
 
 Esta stack não foi só escrita — foi **testada em produção real**, e vários
 comportamentos "óbvios" da documentação oficial se mostraram diferentes na
-prática. Registrar isso aqui evita repetir a mesma investigação:
+prática. Registrar isso aqui evita repetir a mesma investigação. As linhas
+marcadas com 🔒 vêm de uma auditoria de segurança dedicada (ago/2026, pedida
+explicitamente para revisar todo o projeto em busca de erros, melhorias e
+riscos) — cada mudança daquela auditoria foi testada ao vivo antes de
+entrar aqui, inclusive a que deu errado (ver a linha do Postgres) e a que
+ainda está pendente por falta de permissão de execução direta (ver seção
+9.1):
 
 | Problema | Sintoma | Causa raiz | Correção |
 |---|---|---|---|
@@ -693,7 +727,10 @@ prática. Registrar isso aqui evita repetir a mesma investigação:
 | Probes do Postgres citavam um usuário que nunca existiu | `pg_isready -U keycloak_admin` nas probes e na documentação de restore | Copiado de um ambiente de referência diferente — o usuário real (`secrets.yaml` → `POSTGRES_USER`) sempre foi `keycloak_user` | Corrigido em `postgres-db.yaml` (readiness/liveness) e no comentário de restore de `postgres-backup-cronjob.yaml`. Não derrubava as probes (`pg_isready` não valida credencial, só conectividade — confirmado ao vivo), mas quebraria um `psql -U keycloak_admin` real, copiado por alguém em uma emergência |
 | Pipeline podia "mascarar" uma falha real da federação com o AD | Passo 13 do `deploy.yml` sempre terminava em sucesso (verde), mesmo quando o Job de federação falhava de verdade (não só por Secret ausente) | `kubectl wait ... \|\| kubectl logs ...`: `kubectl logs` quase sempre funciona mesmo para um Job que falhou, então o `\|\|` "engolia" o erro | Reescrito para checar o resultado do `kubectl wait` explicitamente e `exit 1` se o Job realmente falhar — a pipeline agora fica corretamente vermelha nesse caso |
 | 🔴 **Senha fictícia do superadmin (`kc_admin`) ativa em produção por semanas** | O valor de `KC_BOOTSTRAP_ADMIN_PASSWORD` em `secrets.yaml` — literalmente escrito como placeholder, com "Tr0c4r" (trocar) no próprio valor — ainda funcionava para logar como `kc_admin` (dono de TODOS os realms), mesmo dias depois do deploy inicial | Essa variável só é lida pelo Keycloak no PRIMEIRÍSSIMO boot — depois disso, editar o arquivo e dar `git push` não muda mais nada (diferente de `POSTGRES_PASSWORD`, que É relida a cada reinício). O comentário original dizia "troque assim que logar" mas não deixava claro que editar o YAML não tem efeito nenhum para esta variável específica | Senha trocada de verdade via `kcadm.sh set-password` (o único jeito que funciona pós-boot); comentário em `secrets.yaml` reescrito explicando o mecanismo e com os comandos exatos de troca, para não se repetir |
-| 🔴 **Trocar a senha do `kc_admin` quebrava o Job de federação no deploy seguinte** | `ldap-federation-setup` passava a falhar logo após "Logging into..." — reproduzido ao vivo minutos depois de trocar a senha do `kc_admin` (ver bug acima) | O Job lia a senha do MESMO campo `KC_BOOTSTRAP_ADMIN_PASSWORD` de `secrets.yaml` para se autenticar a cada execução — mas esse arquivo é reaplicado pela pipeline em TODO deploy (step 4), sempre com o valor fictício, desfazendo qualquer troca real feita via `kcadm` | O Job agora lê a senha de um Secret SEPARADO (`keycloak-admin-credentials`), criado manualmente e nunca recriado pela pipeline — igual ao padrão já usado para `ad-bind-credentials`. `deploy.yml` (passo 13) passou a tolerar também a ausência deste novo Secret |
+| 🔴 **Trocar a senha do `kc_admin` quebrava o Job de federação no deploy seguinte** | `ldap-federation-setup` passava a falhar logo após "Logging into..." — reproduzido ao vivo minutos depois de trocar a senha do `kc_admin` (ver bug acima) | O Job lia a senha do MESMO campo `KC_BOOTSTRAP_ADMIN_PASSWORD` de `secrets.yaml` para se autenticar a cada execução — mas esse arquivo é reaplicado pela pipeline em TODO deploy (step 6, "Aplicar Secrets"), sempre com o valor fictício, desfazendo qualquer troca real feita via `kcadm` | O Job agora lê a senha de um Secret SEPARADO (`keycloak-admin-credentials`), criado manualmente e nunca recriado pela pipeline — igual ao padrão já usado para `ad-bind-credentials`. `deploy.yml` (step 17, "Configurar federação com o Active Directory") passou a tolerar também a ausência deste novo Secret |
+| 🔒 **`securityContext` com `capabilities: drop: ["ALL"]` quebrava o boot do Postgres** | Pod novo em `CrashLoopBackOff` logo após aplicar a mesma baseline de segurança usada no Keycloak/Vaultwarden/Jobs — `chmod: /var/lib/postgresql/data: Operation not permitted` | O ENTRYPOINT oficial da imagem `postgres:16-alpine` roda como root e depende de capabilities Linux reais (`CAP_CHOWN`/`CAP_FOWNER`/`CAP_DAC_OVERRIDE`) para preparar o diretório de dados no boot — rodar como uid 0 e TER as capabilities de root não são a mesma coisa | Revertido (auditoria ago/2026) — ver comentário completo em `postgres-db.yaml`. Rodar como não-root de verdade fica como próximo passo, exigindo uma imagem customizada ou initContainer, testado numa janela de manutenção |
+| 🔒 **UFW não protege portas expostas via Service do Kubernetes (LoadBalancer/NodePort)** | Suposição inicial: "fechar a porta no UFW restringe o acesso" — refutada ao vivo (auditoria ago/2026) | O kube-proxy insere as próprias chains (`KUBE-EXTERNAL-SERVICES`/`KUBE-NODEPORTS`) na cadeia `INPUT` do iptables ANTES das chains do UFW — tráfego para portas de Service (`18443`, `8081`, a porta do Portainer) é aceito ali, sem nunca chegar às regras do UFW. Confirmado testando `curl` na porta `8081` (Vaultwarden) direto pelo IP da VM: responde `200`, mesmo sem NENHUMA regra UFW para ela | UFW continua útil para portas genuinamente do HOST (SSH, e os serviços legados do antigo aaPanel — ver linha abaixo), mas não é a ferramenta certa para restringir acesso a portas de Service do K3s — isso se faz com `NetworkPolicy` de Ingress (`network-policy.yaml`/`network-policy-egress.yaml`) ou convertendo o `Service` para `ClusterIP` quando a porta não precisa ser alcançável de fora (ver o caso do Traefik, linha abaixo) |
+| 🔒 **Traefik (componente padrão do K3s) expondo as portas 80/443 na LAN sem necessidade** | Nenhum `Ingress`/`IngressRoute` é usado neste projeto (Keycloak e Vaultwarden usam `Service LoadBalancer` direto — ver seção 1), então o Traefik nunca foi desligado nem usado, mas continuava ocupando 80/443 na VM | Componente padrão do K3s, nunca desligado pelo `bootstrap-vm.sh` nem documentado | ⏳ Identificado nesta auditoria (ago/2026), correção recomendada mas **ainda não aplicada** (converter o `Service` do `traefik`, no namespace `kube-system`, de `LoadBalancer` para `ClusterIP` — não exige reinstalar o K3s). Ver seção 9 |
 | Timeout do passo de federação curto demais (mascarado até corrigir o bug acima) | Pipeline falhava com "não completou a tempo", mesmo com o Job terminando com sucesso poucos segundos depois, por conta própria | O Job de federação, com sync real de grupos do AD pela rede, leva ~3-4 minutos — mais que o `kubectl wait --timeout=120s` da pipeline. Esse timeout curto sempre existiu, mas ficava escondido pelo bug do `kubectl wait \|\| kubectl logs` (linha acima na tabela) — corrigir um revelou o outro | Timeout do passo elevado para 300s (alinhado com o `activeDeadlineSeconds: 300` já definido no próprio Job), e o teto geral da pipeline (`timeout-minutes`) elevado de 10 para 20 para acomodar a soma de todos os `kubectl wait` no pior caso |
 
 **Padrão comum por trás da maioria destes problemas**: a imagem oficial do
@@ -708,6 +745,91 @@ já causou bugs reais neste projeto.
 ---
 
 ## 9. Próximos passos recomendados
+
+### 9.1. Pendências da auditoria de segurança de ago/2026 que NÃO puderam ser aplicadas nesta sessão
+
+Identificadas e planejadas nesta mesma auditoria (ver seção 8), mas a
+execução ao vivo dessas ações específicas foi bloqueada pela camada de
+segurança do próprio assistente (classificador de permissões, que exige
+uma pessoa humana rodando o comando para mutações consideradas
+sensíveis demais para executar sem supervisão direta) — comandos
+prontos abaixo:
+
+- **🔴 Nginx de borda (`192.168.0.218`) — fora do alcance deste
+  assistente (sem acesso SSH configurado)**:
+  1. `sso.rondonopolis.mt.gov.br.conf` não força HTTPS (falta o bloco
+     `HTTP_TO_HTTPS` que `cofre.rondonopolis.mt.gov.br.conf` já tem) —
+     login/token do Keycloak pode trafegar em texto puro na porta 80.
+     Adicionar, dentro do bloco `#SSL-START`:
+     ```nginx
+     if ($server_port !~ 443){
+         rewrite ^(/.*)$ https://$host$1 permanent;
+     }
+     ```
+  2. `ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3` e cifras com `3DES`/sem PFS
+     em ambos os vhosts — trocar para `ssl_protocols TLSv1.2 TLSv1.3;` e
+     remover `3DES`/`RSA+AES...` (sem ECDHE) da lista de `ssl_ciphers`.
+  3. Depois de aplicar no aaPanel de verdade, atualizar
+     `nginx-edge/sso.rondonopolis.mt.gov.br.conf` (cópia de referência
+     neste repo) para bater com o vhost real.
+
+- **Converter o `Service` do Traefik para `ClusterIP`** (fecha as portas
+  80/443 que ficam abertas na LAN sem necessidade — ver seção 8):
+  ```bash
+  kubectl patch svc traefik -n kube-system -p '{"spec":{"type":"ClusterIP"}}'
+  ```
+
+- **Aplicar `reclaimPolicy: Retain` nos 3 PVs já existentes** (protege
+  contra um `kubectl delete pvc` acidental apagar os dados de verdade —
+  ver `k3s-cluster/storageclass.yaml`):
+  ```bash
+  for pv in $(kubectl get pv -o json | jq -r '.items[] | select(.spec.claimRef.namespace=="authentication") | .metadata.name'); do
+    kubectl patch pv "$pv" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+  done
+  ```
+
+- **Endurecer o SSH e o UFW da VM** (senha habilitada globalmente + porta
+  22 liberada para "Anywhere" + sem fail2ban; regras de firewall
+  herdadas do antigo aaPanel sem serviço nenhum escutando — ver seção
+  8):
+  ```bash
+  # SSH: desabilitar autenticação por senha (root já só aceita chave)
+  echo 'PasswordAuthentication no' | sudo tee /etc/ssh/sshd_config.d/99-hardening.conf
+  sudo sshd -t && sudo systemctl reload ssh
+
+  # fail2ban
+  sudo apt-get install -y fail2ban && sudo systemctl enable --now fail2ban
+
+  # UFW: escopar SSH à LAN + Tailscale ANTES de remover a regra aberta
+  sudo ufw allow from 192.168.0.0/24 to any port 22 proto tcp comment 'SSH - LAN'
+  sudo ufw allow from 100.64.0.0/10 to any port 22 proto tcp comment 'SSH - Tailscale'
+  # valide que a nova regra funciona (nova sessão SSH) ANTES do próximo passo
+  sudo ufw delete allow 22/tcp
+  sudo ufw delete allow 20/tcp && sudo ufw delete allow 21/tcp
+  sudo ufw delete allow 888/tcp && sudo ufw delete allow 39000:40000/tcp
+  sudo ufw delete allow 17761/tcp && sudo ufw delete allow 9000/tcp && sudo ufw delete allow 9000/udp
+  sudo ufw delete allow 80/tcp && sudo ufw delete allow 443/tcp
+  # repita os `ufw delete` acima para as versões "(v6)" de cada regra
+  ```
+
+- **Restringir a permissão do kubeconfig do K3s** (instalado com
+  `--write-kubeconfig-mode 644`, legível por qualquer usuário local da
+  VM — ver `scripts/bootstrap-vm.sh`):
+  ```bash
+  sudo sed -i 's/write-kubeconfig-mode 644/write-kubeconfig-mode 600/' /etc/systemd/system/k3s.service
+  sudo systemctl daemon-reload && sudo systemctl restart k3s
+  # dti já tem sua própria cópia em ~dti/.kube/config (chown separado no
+  # bootstrap) - não é afetada por este restart.
+  ```
+
+- **Escopar o RBAC do runner do GitHub Actions** para o namespace
+  `authentication` em vez de `cluster-admin` sobre o cluster inteiro —
+  ver nota completa no cabeçalho de `deploy.yml`. Fica como o item de
+  maior risco de execução (uma RBAC mal calibrada quebra a própria
+  pipeline de deploy) — recomenda-se testar com um `workflow_dispatch`
+  manual antes de depender dele num push real.
+
+### 9.2. Demais recomendações
 
 - **Certificado LDAPS no Domain Controller**: a federação com o AD já está
   automatizada (`ldap-federation-job.yaml`), mas roda hoje sem

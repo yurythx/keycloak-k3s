@@ -29,9 +29,14 @@
 #   já existentes por trás deles, via `kubectl patch pv <nome> -p
 #   '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'` — uma operação
 #   segura, sem downtime, que não mexe no Pod nem no PVC, só na política
-#   de retenção do volume físico. Rodado uma única vez durante esta
-#   auditoria; não precisa ser repetido a cada deploy (a política fica
-#   gravada no objeto PV, que a pipeline nunca reaplica/sobrescreve).
+#   de retenção do volume físico.
+#   ⏳ PENDENTE (ago/2026): identificado e recomendado nesta auditoria,
+#   mas ainda NÃO aplicado nos 3 PVs existentes — a mutação direta em
+#   objetos do cluster ficou fora do que pôde ser executado nesta sessão
+#   (ver seção 9 do README para o comando exato, os 3 nomes de PV a
+#   rodar, e o motivo de ter ficado pendente). Uma vez aplicado, não
+#   precisa ser repetido a cada deploy (a política fica gravada no
+#   próprio objeto PV, que a pipeline nunca reaplica/sobrescreve).
 #
 #   O PVC novo `vaultwarden-backup-pvc` (ver
 #   `vaultwarden-backup-cronjob.yaml`) já nasce usando esta StorageClass
