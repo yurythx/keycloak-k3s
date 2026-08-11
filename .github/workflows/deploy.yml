@@ -20,17 +20,20 @@
 #   "puxa" o trabalho, e não a GitHub que "empurra" para dentro da rede.
 #
 # 🔒 SOBRE O ESCOPO DE PERMISSÃO DO RUNNER (auditoria ago/2026)
-#   O runner roda como o usuário `dti` (não-root) e usa uma ServiceAccount
-#   dedicada (`gha-deployer`, criada fora deste repositório — ver runbook
-#   na seção 8 do README) com RBAC escopado APENAS ao namespace
-#   `authentication` (mais permissão para gerenciar a própria Namespace e
-#   a StorageClass/ClusterRole de cluster-admin do Portainer, que também
-#   são recursos de escopo de cluster que este pipeline precisa criar/
-#   atualizar). Antes desta auditoria, o runner usava o kubeconfig admin
-#   completo do K3s (`/etc/rancher/k3s/k3s.yaml`), com `cluster-admin`
-#   sobre o cluster INTEIRO — um comprometimento do pipeline (ou de uma
-#   Action de terceiro, se algum dia uma for adicionada) equivalia a
+#   O runner roda como o usuário `dti` (não-root, correto) mas HOJE ainda
+#   usa o kubeconfig admin completo do K3s (`/etc/rancher/k3s/k3s.yaml`,
+#   copiado para `~dti/.kube/config`), com `cluster-admin` sobre o
+#   cluster INTEIRO (inclusive `kube-system` e o namespace `portainer`,
+#   não só `authentication`) — um comprometimento do pipeline (ou de uma
+#   Action de terceiro, se algum dia uma for adicionada) equivale hoje a
 #   controle total do cluster, não só desta stack.
+#   ⏳ PENDENTE (identificado nesta auditoria, ainda NÃO aplicado): trocar
+#   por uma ServiceAccount dedicada, com RBAC escopado ao namespace
+#   `authentication` (mais permissão pontual para gerenciar a própria
+#   Namespace e a StorageClass, que são recursos de escopo de cluster) —
+#   ver seção 9 do README para o racional completo e o motivo de ter
+#   ficado pendente (risco real de quebrar a própria pipeline de deploy
+#   se a RBAC ficar mal calibrada, sem uma janela dedicada para testar).
 # ==============================================================================
 
 name: Deploy Auth Stack para o K3s
@@ -99,11 +102,11 @@ jobs:
     # ↑ ⭐ O CORAÇÃO DA SEGURANÇA DESTE PIPELINE ⭐
     #   Em vez de "ubuntu-latest" (máquina da GitHub), usamos "self-hosted"
     #   para rodar este job DENTRO da própria VM K3s da prefeitura — o
-    #   `kubectl` já está local, autenticado no cluster local (hoje, via um
-    #   kubeconfig escopado ao namespace `authentication` — ver nota de
-    #   segurança no cabeçalho deste arquivo), sem precisar trafegar
-    #   credenciais de acesso pela internet. (Veja o README.md para o
-    #   passo a passo de registro do runner.)
+    #   `kubectl` já está local, autenticado no cluster local (hoje ainda
+    #   com o kubeconfig admin completo — ver nota de segurança pendente
+    #   no cabeçalho deste arquivo), sem precisar trafegar credenciais de
+    #   acesso pela internet. (Veja o README.md para o passo a passo de
+    #   registro do runner.)
 
     timeout-minutes: 20
     # ↑ Mata o job automaticamente se travar além deste tempo — evita que
@@ -239,19 +242,28 @@ jobs:
       - name: 16. Aguardar Keycloak e Vaultwarden ficarem prontos
         run: |
           kubectl rollout status deployment/keycloak \
-            -n authentication --timeout=300s
+            -n authentication --timeout=480s
           kubectl rollout status deployment/vaultwarden \
             -n authentication --timeout=120s
         # ↑ O Keycloak pode demorar para subir na primeira execução (cria o
         #   schema do banco e o Master Realm) e, como usamos
         #   maxUnavailable=0/maxSurge=1, uma troca de imagem/config faz as
         #   2 réplicas serem substituídas uma de cada vez — cada uma leva
-        #   ~60-90s só na fase de "augmentation" do Quarkus (visto na
-        #   prática rodando o primeiro deploy real). 300s dá margem
-        #   confortável para as 2 réplicas trocarem sem falso-negativo
-        #   (o Deployment fica saudável de qualquer forma, mesmo se este
-        #   passo estourar o tempo — é só a CONFIRMAÇÃO da pipeline que
-        #   ficaria imprecisa com um timeout curto demais).
+        #   ~60-90s só na fase de "augmentation" do Quarkus em trocas
+        #   normais. 🔒 `--timeout` elevado de 300s para 480s em auditoria
+        #   de segurança (ago/2026): reproduzido ao vivo — o deploy que
+        #   pulou 7 versões menores do Keycloak de uma vez (26.0 → 26.7.0)
+        #   levou mais que 300s para as 2 réplicas trocarem (cada uma com
+        #   uma fase de "augmentation"/migração maior que o normal, só
+        #   nesta troca específica), e o `kubectl rollout status` estourou
+        #   o timeout — MESMO com o rollout terminando com sucesso pouco
+        #   depois por conta própria (confirmado observando os Pods ao
+        #   vivo: chegaram a 2/2 Ready minutos depois do timeout da
+        #   pipeline). O Deployment fica saudável de qualquer forma, mesmo
+        #   se este passo estourar o tempo — é só a CONFIRMAÇÃO da
+        #   pipeline que fica imprecisa com um timeout curto demais (mesmo
+        #   padrão de bug já visto no timeout da federação com o AD — ver
+        #   seção 8 do README).
 
       - name: 17. Configurar federação com o Active Directory
         run: |
