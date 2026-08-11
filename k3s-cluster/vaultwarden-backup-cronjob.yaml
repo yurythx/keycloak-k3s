@@ -1,0 +1,212 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/vaultwarden-backup-cronjob.yaml
+# ------------------------------------------------------------------------------
+# 🔒 ARQUIVO NOVO — criado em auditoria de segurança (ago/2026)
+#
+# OBJETIVO
+#   Fazer backup diário do volume de dados do Vaultwarden (`/data`: banco
+#   SQLite, chaves RSA do servidor e anexos dos usuários). Até esta
+#   auditoria, SOMENTE o PostgreSQL/Keycloak tinha backup automatizado — o
+#   cofre de senhas da equipe de TI (Vaultwarden) não tinha NENHUM,
+#   apesar de guardar dados tão sensíveis quanto o próprio Keycloak (as
+#   chaves mestras dos cofres, irrecuperáveis se perdidas). Combinado com
+#   a StorageClass `local-path` usando `reclaimPolicy: Delete` (ver
+#   `k3s-cluster/storageclass.yaml`), um `kubectl delete pvc` acidental
+#   apagaria o cofre inteiro sem nenhuma chance de recuperação.
+#
+# COMO FUNCIONA
+#   Diferente do Postgres (que usa `pg_dump`, um comando de exportação
+#   lógica), o Vaultwarden não tem um utilitário de export/dump oficial —
+#   o backup aqui é um `tar` simples de todo o diretório `/data`, montado
+#   em modo SOMENTE LEITURA (`readOnly: true` no volumeMount) para nunca
+#   arriscar corromper o volume real enquanto o Vaultwarden está rodando
+#   (é seguro fazer isso com SQLite em uso: o `tar` lê os bytes do arquivo
+#   como estão no momento, o pior caso é um backup com uma transação em
+#   andamento capturada pela metade — aceitável para um backup diário de
+#   madrugada, mesma janela de baixo uso do backup do Postgres).
+#
+#   RWO (ReadWriteOnce) permite múltiplos Pods montando o MESMO volume
+#   SIMULTANEAMENTE desde que estejam no MESMO nó — o que é sempre
+#   verdade aqui, já que o cluster é single-node (ver mesma observação em
+#   `postgres-backup-cronjob.yaml`, mas lá o segundo Pod nunca chega a
+#   coexistir porque usa uma conexão de rede via Service, não o volume
+#   direto).
+#
+# ⚠️ LIMITAÇÃO (mesma do backup do Postgres — ver postgres-backup-cronjob.yaml)
+#   Fica no MESMO disco físico da VM — protege contra erro humano
+#   (`kubectl delete pvc`, corrupção de banco), mas NÃO contra perda física
+#   da VM inteira. Complementar com uma cópia off-site é recomendado.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1) PersistentVolumeClaim — disco dedicado para os arquivos de backup
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultwarden-backup-pvc
+  namespace: authentication
+  labels:
+    app: vaultwarden-backup
+
+spec:
+  accessModes:
+    - ReadWriteOnce
+
+  storageClassName: local-path-retain
+  # ↑ 🔒 Diferente dos PVCs mais antigos deste projeto (que usam
+  #   `local-path`, `reclaimPolicy: Delete`): este PVC é novo, então já
+  #   nasce na StorageClass `local-path-retain` (ver
+  #   `k3s-cluster/storageclass.yaml`) — um `kubectl delete pvc` acidental
+  #   aqui NÃO apaga os arquivos de backup em disco, só o objeto PVC (o
+  #   PersistentVolume some da lista, mas fica em estado "Released", com
+  #   os dados intactos, recuperável manualmente). Os PVCs mais antigos
+  #   (`postgres-pvc`, `postgres-backup-pvc`, `vaultwarden-pvc`) não podem
+  #   trocar de StorageClass depois de criados (campo imutável) — para
+  #   eles, a mesma proteção foi aplicada diretamente no objeto
+  #   PersistentVolume já existente (`kubectl patch pv ... Retain`), fora
+  #   deste arquivo — ver runbook na seção 8 do README.
+
+  resources:
+    requests:
+      storage: 5Gi
+      # ↑ Cofre de senhas tende a ser pequeno (texto cifrado + poucos
+      #   anexos) — 5Gi é generoso mesmo com retenção de 7 dias.
+
+---
+# ------------------------------------------------------------------------------
+# 2) CronJob — tar do /data do Vaultwarden todo dia às 03:15 (Rondonópolis-MT)
+# ------------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vaultwarden-backup
+  namespace: authentication
+
+spec:
+  schedule: "15 3 * * *"
+  # ↑ 15 minutos depois do backup do Postgres (03:00) — evita os dois
+  #   `tar`/`pg_dump` disputando I/O de disco ao mesmo tempo na VM.
+
+  timeZone: "America/Cuiaba"
+
+  concurrencyPolicy: Forbid
+
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+
+      template:
+        metadata:
+          labels:
+            app: vaultwarden-backup
+            # ↑ Rótulo só organizacional aqui — diferente do
+            #   `app: postgres-backup`, este Job NÃO precisa atravessar
+            #   nenhuma NetworkPolicy (não fala com o Postgres, só lê um
+            #   volume local).
+        spec:
+          restartPolicy: OnFailure
+
+          containers:
+            - name: vaultwarden-backup
+              image: alpine:3.20
+              # ↑ Imagem mínima só para rodar `tar`/`find`/`sh` — não
+              #   precisamos de nenhum utilitário específico do
+              #   Vaultwarden (diferente do backup do Postgres, que
+              #   precisa do `pg_dump` compatível com a versão do banco).
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+                # ↑ SEM `runAsNonRoot`: o volume de origem (`vaultwarden-pvc`)
+                #   é dono de root (ver comentário em vaultwarden.yaml) — o
+                #   `tar` precisa conseguir LER todos os arquivos dele,
+                #   inclusive os que só root consegue ler.
+
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+
+                  DATA_HORA=$(date +%Y%m%d_%H%M%S)
+                  ARQUIVO="/backups/vaultwarden_${DATA_HORA}.tar.gz"
+
+                  echo "Iniciando backup do Vaultwarden (/data) em ${ARQUIVO}..."
+
+                  tar -czf "${ARQUIVO}" -C /vaultwarden-data .
+                  # ↑ `-C /vaultwarden-data .` entra no diretório antes de
+                  #   compactar, para o `.tar.gz` conter os arquivos na
+                  #   raiz (sem o prefixo "vaultwarden-data/" em cada
+                  #   entrada) — mais simples de restaurar depois.
+
+                  TAMANHO_BYTES=$(wc -c < "${ARQUIVO}")
+
+                  if [ "${TAMANHO_BYTES}" -lt 1024 ]; then
+                    echo "ERRO: o backup gerado tem apenas ${TAMANHO_BYTES} bytes — suspeito demais para ser um backup real do cofre. Abortando e removendo o arquivo inválido."
+                    rm -f "${ARQUIVO}"
+                    exit 1
+                  fi
+                  # ↑ Mesma camada extra de proteção usada no backup do
+                  #   Postgres (ver postgres-backup-cronjob.yaml) — um
+                  #   backup real do Vaultwarden nunca fica abaixo de 1KB
+                  #   (o `db.sqlite3` sozinho já tem centenas de KB).
+
+                  echo "Backup concluído: ${ARQUIVO} (${TAMANHO_BYTES} bytes)"
+
+                  echo "Removendo backups com mais de 7 dias..."
+                  find /backups -name "vaultwarden_*.tar.gz" -type f -mtime +7 -delete
+
+                  echo "Backups atuais em /backups:"
+                  ls -lh /backups
+
+              volumeMounts:
+                - name: vaultwarden-data
+                  mountPath: /vaultwarden-data
+                  readOnly: true
+                  # ↑ Montagem SOMENTE LEITURA do volume real do
+                  #   Vaultwarden — este Job nunca escreve nele, só lê
+                  #   para compactar (ver explicação completa no
+                  #   cabeçalho deste arquivo).
+                - name: backup-storage
+                  mountPath: /backups
+
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "256Mi"
+
+          volumes:
+            - name: vaultwarden-data
+              persistentVolumeClaim:
+                claimName: vaultwarden-pvc
+                # ↑ O MESMO PVC que `vaultwarden.yaml` usa para os dados
+                #   reais — montado aqui em paralelo, só leitura (ver
+                #   explicação de RWO single-node no cabeçalho).
+            - name: backup-storage
+              persistentVolumeClaim:
+                claimName: vaultwarden-backup-pvc
+
+# ==============================================================================
+# COMO RESTAURAR UM BACKUP MANUALMENTE (procedimento de emergência):
+#   1. Escale o Vaultwarden para 0 réplicas (evita escrita concorrente durante a restauração):
+#        kubectl scale deployment/vaultwarden -n authentication --replicas=0
+#   2. Liste os backups disponíveis (Pod auxiliar temporário, mesmo padrão do
+#      restore do Postgres — ver postgres-backup-cronjob.yaml):
+#        kubectl run -n authentication restore-helper --rm -it \
+#          --image=alpine:3.20 --restart=Never \
+#          --overrides='{"spec":{"containers":[{"name":"restore-helper","image":"alpine:3.20","command":["sh"],"stdin":true,"tty":true,"volumeMounts":[{"name":"b","mountPath":"/backups"},{"name":"d","mountPath":"/data"}]}],"volumes":[{"name":"b","persistentVolumeClaim":{"claimName":"vaultwarden-backup-pvc"}},{"name":"d","persistentVolumeClaim":{"claimName":"vaultwarden-pvc"}}]}}'
+#      Dentro do shell aberto:
+#        ls -lh /backups
+#        rm -rf /data/* && tar -xzf /backups/vaultwarden_XXXXXXXX.tar.gz -C /data
+#   3. Escale o Vaultwarden de volta:
+#        kubectl scale deployment/vaultwarden -n authentication --replicas=1
+# ==============================================================================

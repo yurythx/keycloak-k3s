@@ -1,0 +1,75 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/storageclass.yaml
+# ------------------------------------------------------------------------------
+# 🔒 ARQUIVO NOVO — criado em auditoria de segurança (ago/2026)
+#
+# OBJETIVO
+#   A StorageClass padrão do K3s (`local-path`, instalada de fábrica pelo
+#   Local Path Provisioner) usa `reclaimPolicy: Delete` — assim que o
+#   PersistentVolumeClaim (PVC) é apagado, o PersistentVolume (PV) E OS
+#   DADOS EM DISCO são apagados junto, imediatamente, sem confirmação
+#   extra. Para um banco de autenticação governamental e um cofre de
+#   senhas, um `kubectl delete pvc` digitado por engano (namespace errado,
+#   comando colado errado) apaga os dados de verdade, sem chance de
+#   `undo` — só resta o backup do dia anterior (se existir).
+#
+#   Esta StorageClass é IDÊNTICA à `local-path` embutida do K3s (mesmo
+#   provisionador, mesmo binding mode), com UMA diferença:
+#   `reclaimPolicy: Retain` — apagar o PVC deixa o PersistentVolume em
+#   estado `Released` (com os dados intactos no disco), exigindo um passo
+#   manual explícito para realmente liberar/apagar o espaço. Troca
+#   conveniência automática por uma rede de segurança contra erro humano.
+#
+# ⚠️ POR QUE ISTO SÓ VALE PARA PVCs NOVOS (não para os 3 já existentes)
+#   `storageClassName` é um campo IMUTÁVEL de um PVC já criado — não dá
+#   para simplesmente editar `postgres-pvc`, `postgres-backup-pvc` ou
+#   `vaultwarden-pvc` para apontar pra cá (o `kubectl apply` seria
+#   rejeitado pela API do Kubernetes). Para esses três, a mesma proteção
+#   (`Retain`) foi aplicada diretamente nos objetos PersistentVolume (PV)
+#   já existentes por trás deles, via `kubectl patch pv <nome> -p
+#   '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'` — uma operação
+#   segura, sem downtime, que não mexe no Pod nem no PVC, só na política
+#   de retenção do volume físico. Rodado uma única vez durante esta
+#   auditoria; não precisa ser repetido a cada deploy (a política fica
+#   gravada no objeto PV, que a pipeline nunca reaplica/sobrescreve).
+#
+#   O PVC novo `vaultwarden-backup-pvc` (ver
+#   `vaultwarden-backup-cronjob.yaml`) já nasce usando esta StorageClass
+#   diretamente — é o primeiro caso real de uso dela.
+#
+# NÃO É A STORAGECLASS PADRÃO DO CLUSTER (de propósito)
+#   Não usamos `storageclass.kubernetes.io/is-default-class: "true"` aqui
+#   — a `local-path` original do K3s continua sendo a padrão. Qualquer
+#   PVC futuro que não especificar `storageClassName` explicitamente
+#   continua caindo no comportamento de fábrica do K3s (Delete). Escolher
+#   `local-path-retain` é uma decisão CONSCIENTE, por PVC, não um valor
+#   global — evita surpresas em PVCs de teste/descartáveis que alguém
+#   crie no futuro (esses SIM devem poder ser apagados sem deixar volumes
+#   órfãos acumulando espaço em disco).
+# ==============================================================================
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path-retain
+  labels:
+    app.kubernetes.io/part-of: prefeitura-auth-stack
+
+provisioner: rancher.io/local-path
+# ↑ MESMO provisionador da StorageClass `local-path` de fábrica do K3s —
+#   não estamos trocando COMO o disco é provisionado, só a política do
+#   que acontece quando o PVC é apagado.
+
+reclaimPolicy: Retain
+# ↑ A mudança real: ver explicação completa no cabeçalho deste arquivo.
+
+volumeBindingMode: WaitForFirstConsumer
+# ↑ Mesmo comportamento da StorageClass padrão: só provisiona o volume de
+#   verdade quando um Pod que o usa é de fato agendado (evita criar
+#   volumes órfãos se o PVC for criado mas nunca usado).
+
+allowVolumeExpansion: true
+# ↑ Diferente da `local-path` de fábrica (que vem com `false`) — o
+#   Local Path Provisioner SUPORTA expansão de volume; habilitamos aqui
+#   para os PVCs novos não terem essa limitação (ver achado de auditoria
+#   correspondente no README, seção 8).
