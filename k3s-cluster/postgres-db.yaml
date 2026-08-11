@@ -163,26 +163,33 @@ spec:
               # ↑ Teto máximo de RAM. Se ultrapassar, o Kubernetes mata o
               #   container (OOMKilled) e o Deployment sobe outro no lugar.
 
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            seccompProfile:
-              type: RuntimeDefault
-            # ↑ 🔒 Baseline de segurança (auditoria ago/2026) — mesmo
-            #   raciocínio do Vaultwarden (ver comentário lá): o volume de
-            #   dados já está em produção gravado por um processo root
-            #   (`ls -la /var/lib/postgresql/data` mostra dono `70:70`, o
-            #   uid/gid interno "postgres" da imagem alpine — mas o
-            #   container em si, sem `runAsUser`, entra como root e o
-            #   ENTRYPOINT oficial da imagem é quem faz o `gosu postgres`
-            #   internamente). Forçar `runAsNonRoot`/`runAsUser: 70` aqui,
-            #   sem testar antes numa janela de manutenção, puxa o tapete
-            #   do entrypoint oficial (que assume que PODE rodar como root
-            #   na inicialização para preparar `/var/run/postgresql` e
-            #   permissões) — risco real de CrashLoopBackOff no único
-            #   banco desta stack, sem réplica. Fica como próximo passo
-            #   RECOMENDADO, mas fora desta rodada (ver seção 9 do README).
+          # ↑ 🔒 SEM `securityContext` de propósito — TESTADO AO VIVO em
+          #   auditoria de segurança (ago/2026) e REVERTIDO depois de uma
+          #   falha real: aplicamos `capabilities: drop: ["ALL"]` (mesma
+          #   baseline usada no Keycloak/Vaultwarden/Jobs desta stack) e o
+          #   Pod novo entrou em CrashLoopBackOff imediatamente —
+          #   `kubectl logs` mostrou:
+          #     chmod: /var/lib/postgresql/data: Operation not permitted
+          #     chmod: /var/run/postgresql: Operation not permitted
+          #     find: /var/lib/postgresql/data: Permission denied
+          #   Causa: o ENTRYPOINT oficial da imagem `postgres:16-alpine`
+          #   roda como root (uid 0) e depende de capabilities Linux reais
+          #   (CAP_CHOWN/CAP_FOWNER/CAP_DAC_OVERRIDE, entre outras) para
+          #   ajustar a posse/permissão de `/var/lib/postgresql/data` e
+          #   criar `/var/run/postgresql` no boot — "rodar como root" e
+          #   "ter as capabilities de root" NÃO são a mesma coisa:
+          #   `drop: ["ALL"]` tira essas capabilities MESMO de um processo
+          #   com uid 0, e o entrypoint não tem nenhum fallback para esse
+          #   cenário. Sem downtime real na hora (o Pod ANTIGO, saudável,
+          #   continuou servindo o Postgres normalmente enquanto o rollout
+          #   ficava travado no Pod novo — ver `strategy` do Deployment,
+          #   que não é explícita aqui, então usa o padrão do Kubernetes:
+          #   sobe o novo antes de derrubar o velho), mas o pod novo nunca
+          #   ficou pronto. Revertido nesta mesma auditoria. Rodar como
+          #   não-root de verdade aqui exigiria trocar `USER` na imagem
+          #   (uma imagem customizada) ou usar um initContainer root só
+          #   para o chmod inicial — vale como próximo passo, com uma
+          #   janela de manutenção testada antes, não às cegas num push.
 
           readinessProbe:
             # ↑ Pergunta "este Pod já está PRONTO para receber tráfego?".
@@ -223,12 +230,12 @@ spec:
             #   enquanto ele ainda está subindo pela primeira vez.
             periodSeconds: 20
 
-      # ↑ Baseline de securityContext aplicada acima (auditoria ago/2026:
-      # sem capabilities, sem escalonamento de privilégio, seccomp padrão).
-      # `runAsNonRoot`/`readOnlyRootFilesystem` continuam de fora de
-      # propósito — ver o comentário completo dentro do securityContext do
-      # container, acima, para o motivo (risco real de CrashLoopBackOff no
-      # único banco desta stack sem uma janela de manutenção testada).
+      # ↑ "securityContext" avançado testado ao vivo e REVERTIDO nesta
+      # auditoria (ago/2026) depois de causar CrashLoopBackOff real — ver
+      # o comentário completo acima, logo depois de `image:`, com o erro
+      # exato e a causa raiz. Em produção, este é o próximo passo
+      # recomendado, mas exige uma imagem customizada ou initContainer,
+      # testado numa janela de manutenção — não às cegas num deploy normal.
 
       volumes:
         - name: postgres-storage
