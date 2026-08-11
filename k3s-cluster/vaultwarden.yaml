@@ -88,12 +88,35 @@ spec:
     spec:
       containers:
         - name: vaultwarden
-          image: vaultwarden/server:1.32.5-alpine
+          image: vaultwarden/server:1.37.1-alpine
           # ↑ Imagem oficial do Vaultwarden, variante "alpine" (mais leve).
-          #   ⚠️ Verifique periodicamente por versões mais novas em:
-          #   https://github.com/dani-garcia/vaultwarden/releases
-          #   e atualize esta tag conforme a política de patches de segurança
-          #   da prefeitura (recomenda-se checar mensalmente).
+          #   🔒 Atualizado de 1.32.5 para 1.37.1 em auditoria de segurança
+          #   (ago/2026) — a 1.37.0 corrigiu 9 vulnerabilidades de
+          #   severidade média (SSRF, acesso cross-organization, DoS);
+          #   produção ficou rodando 1.32.5 por meses mesmo depois de já
+          #   terem testado a 1.37.1 num Pod descartável (ver seção 7.6 do
+          #   README). ⚠️ Continue verificando periodicamente por versões
+          #   mais novas em https://github.com/dani-garcia/vaultwarden/releases
+          #   (recomenda-se checar mensalmente).
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+            # ↑ 🔒 Baseline de segurança (auditoria ago/2026). NÃO
+            #   adicionamos `runAsNonRoot`/`runAsUser` aqui: o volume
+            #   `/data` já está em produção com dados reais, hoje gravado
+            #   por um processo root (`ls -la /data` mostra dono `0:0`); a
+            #   imagem oficial do Vaultwarden não documenta um UID
+            #   não-root suportado nativamente, e forçar um UID diferente
+            #   sem antes re-donar (`chown`) o volume via um initContainer
+            #   quebraria a escrita no banco SQLite/anexos existentes —
+            #   risco de indisponibilidade real desproporcional ao ganho,
+            #   sem uma janela de manutenção. As três opções acima (sem
+            #   capabilities, sem escalonamento de privilégio, seccomp
+            #   padrão) já reduzem a superfície sem tocar em UID/dono.
 
           ports:
             - name: http

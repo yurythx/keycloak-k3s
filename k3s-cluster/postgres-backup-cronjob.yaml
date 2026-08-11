@@ -158,6 +158,23 @@ spec:
               #   a versão do servidor PostgreSQL que está gerando o backup
               #   (evita erros sutis de incompatibilidade entre versões).
 
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+                # ↑ 🔒 Baseline de segurança (auditoria ago/2026). SEM
+                #   `runAsNonRoot` de propósito: este Job troca o
+                #   ENTRYPOINT padrão da imagem (usa `command:` abaixo), e
+                #   o volume `postgres-backup-pvc` foi provisionado sem
+                #   `fsGroup` definido (dono root) — forçar um UID não-root
+                #   aqui, sem ajustar a posse do volume junto, quebraria a
+                #   escrita em `/backups` (o backup diário pararia de
+                #   funcionar silenciosamente até alguém notar). Mesmo
+                #   raciocínio do Postgres em si — ver comentário completo
+                #   em postgres-db.yaml.
+
               env:
                 - name: PGHOST
                   value: "postgres"

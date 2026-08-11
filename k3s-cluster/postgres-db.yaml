@@ -163,6 +163,27 @@ spec:
               # ↑ Teto máximo de RAM. Se ultrapassar, o Kubernetes mata o
               #   container (OOMKilled) e o Deployment sobe outro no lugar.
 
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+            # ↑ 🔒 Baseline de segurança (auditoria ago/2026) — mesmo
+            #   raciocínio do Vaultwarden (ver comentário lá): o volume de
+            #   dados já está em produção gravado por um processo root
+            #   (`ls -la /var/lib/postgresql/data` mostra dono `70:70`, o
+            #   uid/gid interno "postgres" da imagem alpine — mas o
+            #   container em si, sem `runAsUser`, entra como root e o
+            #   ENTRYPOINT oficial da imagem é quem faz o `gosu postgres`
+            #   internamente). Forçar `runAsNonRoot`/`runAsUser: 70` aqui,
+            #   sem testar antes numa janela de manutenção, puxa o tapete
+            #   do entrypoint oficial (que assume que PODE rodar como root
+            #   na inicialização para preparar `/var/run/postgresql` e
+            #   permissões) — risco real de CrashLoopBackOff no único
+            #   banco desta stack, sem réplica. Fica como próximo passo
+            #   RECOMENDADO, mas fora desta rodada (ver seção 9 do README).
+
           readinessProbe:
             # ↑ Pergunta "este Pod já está PRONTO para receber tráfego?".
             #   Enquanto a resposta for "não", o Service não envia requisições
@@ -202,9 +223,12 @@ spec:
             #   enquanto ele ainda está subindo pela primeira vez.
             periodSeconds: 20
 
-      # (Sem "securityContext" avançado aqui por simplicidade didática — em
-      # produção, considere rodar como usuário não-root e com
-      # `readOnlyRootFilesystem` onde a imagem permitir.)
+      # ↑ Baseline de securityContext aplicada acima (auditoria ago/2026:
+      # sem capabilities, sem escalonamento de privilégio, seccomp padrão).
+      # `runAsNonRoot`/`readOnlyRootFilesystem` continuam de fora de
+      # propósito — ver o comentário completo dentro do securityContext do
+      # container, acima, para o motivo (risco real de CrashLoopBackOff no
+      # único banco desta stack sem uma janela de manutenção testada).
 
       volumes:
         - name: postgres-storage

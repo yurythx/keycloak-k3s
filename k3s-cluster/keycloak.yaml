@@ -132,13 +132,44 @@ spec:
                 # ↑ "Prefira" (não exige — é soft) agendar cada réplica em um
                 #   nó (VM) físico diferente, para resiliência a falha de host.
 
+      securityContext:
+        runAsNonRoot: true
+        # ↑ 🔒 Adicionado em auditoria de segurança (ago/2026): a imagem
+        #   oficial do Keycloak já roda como usuário não-root por padrão
+        #   (confirmado ao vivo: uid=1000, gid=0 — padrão "arbitrary UID"
+        #   compatível com OpenShift), então isto só formaliza/EXIGE esse
+        #   comportamento (o Pod é recusado pelo kubelet se algum dia a
+        #   imagem mudar para rodar como root). Diferente do Postgres/
+        #   Vaultwarden (ver comentário equivalente em postgres-db.yaml),
+        #   aqui é seguro fixar porque não há necessidade de operação como
+        #   root nem re-dono de arquivos em volume persistente.
+
       containers:
         - name: keycloak
-          image: quay.io/keycloak/keycloak:26.0
+          image: quay.io/keycloak/keycloak:26.7.0
           # ↑ Imagem OFICIAL do Keycloak, distribuída pelo próprio projeto
           #   (Quay.io, não Docker Hub), versão 26 — a série "Novo Keycloak"
           #   100% baseada em Quarkus (start-up rápido, baixo consumo de RAM
           #   comparado ao antigo Keycloak baseado em WildFly).
+          #   🔒 Atualizado de 26.0 para 26.7.0 em auditoria de segurança
+          #   (ago/2026) — 26.0 estava several patches atrás; a migração de
+          #   schema do banco (Liquibase) roda sozinha no boot, é o
+          #   mecanismo padrão suportado pelo próprio Keycloak entre
+          #   versões da série 26.x. Verifique periodicamente por novas
+          #   patches em https://www.keycloak.org/downloads.
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+            # ↑ 🔒 Baseline de segurança adicionada na mesma auditoria:
+            #   remove qualquer capability Linux desnecessária, impede que
+            #   o processo ganhe mais privilégio do que já tem, e aplica o
+            #   perfil seccomp padrão do runtime (containerd) — nenhuma
+            #   dessas três opções depende de UID/dono de arquivo, então
+            #   não têm risco de quebrar nada em runtime.
 
           args: ["start"]
           # ↑ "start" inicia o Keycloak em modo de produção (diferente de

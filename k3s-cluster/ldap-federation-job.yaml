@@ -71,6 +71,19 @@ spec:
   #   "pendurado" bloqueando `kubectl` ou consumindo recursos indefinidamente.
 
   template:
+    metadata:
+      labels:
+        app: ldap-federation
+        # ↑ 🔒 Rótulo adicionado em auditoria de segurança (ago/2026): até
+        #   então este Job não tinha NENHUM rótulo `app` explícito (só os
+        #   automáticos do Kubernetes, tipo `job-name`) — o que o deixava
+        #   FORA do alcance de qualquer `podSelector` de NetworkPolicy.
+        #   Necessário para a NetworkPolicy de Egress em
+        #   `network-policy-egress.yaml` conseguir liberar, especificamente
+        #   para este Job, o acesso ao Keycloak (autenticação via kcadm) e
+        #   ao Domain Controller do AD (federação LDAP) — sem quebrar o
+        #   isolamento de todos os outros Pods do namespace.
+
     spec:
       restartPolicy: OnFailure
       # ↑ Jobs não aceitam `Always` — `OnFailure` deixa o Kubernetes tentar
@@ -78,10 +91,25 @@ spec:
 
       containers:
         - name: kcadm-setup
-          image: quay.io/keycloak/keycloak:26.0
+          image: quay.io/keycloak/keycloak:26.7.0
           # ↑ MESMA imagem do Keycloak em si — não precisa de nenhuma imagem
           #   extra, pois o `kcadm.sh` (CLI de administração) já vem
           #   embutido em /opt/keycloak/bin/kcadm.sh nesta imagem oficial.
+          #   🔒 Mantida em sincronia com a tag usada em keycloak.yaml
+          #   (auditoria ago/2026) — evita rodar `kcadm.sh` de uma versão
+          #   diferente da que está de fato no ar.
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+            # ↑ 🔒 Baseline de segurança (auditoria ago/2026) — este Job já
+            #   roda como o mesmo usuário não-root da imagem do Keycloak
+            #   (uid 1000), então dá pra ir além do que fizemos no
+            #   container principal do Keycloak:
+            runAsNonRoot: true
 
           command: ["/bin/bash", "-c"]
           args:
@@ -418,7 +446,8 @@ spec:
               #   VEM DE UM SECRET SEPARADO, não de `auth-stack-credentials`:
               #   a versão anterior lia `KC_BOOTSTRAP_ADMIN_PASSWORD` direto
               #   de `secrets.yaml` — mas esse arquivo é reaplicado pela
-              #   pipeline TODO deploy (step 4), sempre com o valor FICTÍCIO
+              #   pipeline TODO deploy (step 6, "Aplicar Secrets"), sempre
+              #   com o valor FICTÍCIO
               #   ali dentro. O Keycloak em si ignora esse valor após o
               #   primeiro boot (não tem problema o arquivo ficar
               #   desatualizado), mas este Job usa e PRECISA do valor
