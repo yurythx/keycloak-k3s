@@ -1,0 +1,189 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/portainer.yaml
+# ------------------------------------------------------------------------------
+# 🔒 ARQUIVO NOVO NO REPOSITÓRIO — criado em auditoria de segurança
+# (ago/2026). O Portainer já estava rodando no cluster antes disso (foi
+# aplicado manualmente, a partir de
+# https://downloads.portainer.io/ce2-21/portainer.yaml, para dar
+# visibilidade/controle visual do cluster), mas o manifesto NUNCA tinha
+# sido versionado neste Git — quebrava a promessa de "100% GitOps" do
+# projeto (se o cluster fosse recriado do zero só a partir deste
+# repositório, o Portainer não voltaria a existir, e não havia registro
+# de qual configuração exata estava de fato rodando).
+#
+# DUAS MUDANÇAS DELIBERADAS EM RELAÇÃO AO MANIFESTO OFICIAL DA PORTAINER:
+#   1. REMOVIDA a porta HTTP (9000/NodePort 30777) do Service — só HTTPS
+#      (9443/NodePort 30779) fica exposta na rede. O manifesto oficial
+#      expõe as duas por padrão; como esta ServiceAccount tem
+#      `cluster-admin` sobre o cluster INTEIRO (ver RBAC abaixo), login
+#      por HTTP nessa porta trafegaria usuário/senha em texto puro na LAN
+#      — risco desproporcional para o ganho de "ter as duas opções".
+#   2. Adicionado `resources` (requests/limits) — o manifesto oficial
+#      vem com `resources: {}` (sem nenhum limite), inconsistente com o
+#      resto deste projeto, que define limites para todo container (ver
+#      seção 2 do README).
+#
+# ⚠️ POR QUE `cluster-admin` (e não algo mais restrito)
+#   É a permissão que a própria Portainer pede para funcionar por completo
+#   (gerenciar qualquer namespace/recurso pelo painel) — é o modelo
+#   suportado oficialmente pelo projeto. Mitigação real: só o Service
+#   HTTPS fica acessível na rede (mudança 1 acima), e o acesso à própria
+#   UI do Portainer deve ser tratado como equivalente a acesso root ao
+#   cluster (MFA na conta, senha forte, não compartilhar credencial).
+# ==============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portainer
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    # ↑ Exigido pela própria Portainer para conseguir montar volumes/rodar
+    #   com os privilégios que o painel precisa para gerenciar o cluster.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portainer-sa-clusteradmin
+  namespace: portainer
+  labels:
+    app.kubernetes.io/name: portainer
+    app.kubernetes.io/instance: portainer
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: portainer
+  namespace: portainer
+  labels:
+    app.kubernetes.io/name: portainer
+    app.kubernetes.io/instance: portainer
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: "10Gi"
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portainer
+  labels:
+    app.kubernetes.io/name: portainer
+    app.kubernetes.io/instance: portainer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    namespace: portainer
+    name: portainer-sa-clusteradmin
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portainer
+  namespace: portainer
+  labels:
+    app.kubernetes.io/name: portainer
+    app.kubernetes.io/instance: portainer
+spec:
+  type: NodePort
+  ports:
+    - port: 9443
+      targetPort: 9443
+      protocol: TCP
+      name: https
+      nodePort: 30779
+      # ↑ 🔒 Única porta de acesso web exposta (auditoria ago/2026) — ver
+      #   explicação completa no cabeçalho deste arquivo.
+    - port: 30776
+      targetPort: 30776
+      protocol: TCP
+      name: edge
+      nodePort: 30776
+      # ↑ Porta do "Edge Agent" (não usada hoje — só relevante se algum
+      #   dia conectarem outro cluster remoto via Portainer Edge).
+  selector:
+    app.kubernetes.io/name: portainer
+    app.kubernetes.io/instance: portainer
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portainer
+  namespace: portainer
+  labels:
+    app.kubernetes.io/name: portainer
+    app.kubernetes.io/instance: portainer
+spec:
+  replicas: 1
+  strategy:
+    type: "Recreate"
+    # ↑ Igual ao Vaultwarden: o PVC é ReadWriteOnce, então precisa liberar
+    #   o volume antes do novo Pod subir.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: portainer
+      app.kubernetes.io/instance: portainer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portainer
+        app.kubernetes.io/instance: portainer
+    spec:
+      serviceAccountName: portainer-sa-clusteradmin
+      volumes:
+        - name: "data"
+          persistentVolumeClaim:
+            claimName: portainer
+      containers:
+        - name: portainer
+          image: "portainer/portainer-ce:2.21.5"
+          imagePullPolicy: IfNotPresent
+          # ↑ 🔒 Trocado de `Always` (padrão do manifesto oficial) para
+          #   `IfNotPresent` (auditoria ago/2026) — já fixamos uma tag de
+          #   versão exata (`2.21.5`, não `latest`), então não há motivo
+          #   pra bater no registry a cada restart do Pod; reduz
+          #   dependência de rede e é consistente com o resto do projeto
+          #   (nenhuma outra imagem desta stack usa `Always`).
+          args:
+            - "--tunnel-port=30776"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          ports:
+            - name: https
+              containerPort: 9443
+              protocol: TCP
+            - name: tcp-edge
+              containerPort: 8000
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9443
+              scheme: HTTPS
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9443
+              scheme: HTTPS
+          resources:
+            # ↑ 🔒 Adicionado em auditoria (ago/2026) — o manifesto oficial
+            #   vem com `resources: {}`. Valores calibrados pelo consumo
+            #   real observado (`kubectl top pod -n portainer`) mais
+            #   margem confortável.
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

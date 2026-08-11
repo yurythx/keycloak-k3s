@@ -18,6 +18,19 @@
 #   servidores da GitHub buscar trabalho — nenhuma porta de entrada
 #   (inbound) precisa ser aberta no firewall da prefeitura. É o runner que
 #   "puxa" o trabalho, e não a GitHub que "empurra" para dentro da rede.
+#
+# 🔒 SOBRE O ESCOPO DE PERMISSÃO DO RUNNER (auditoria ago/2026)
+#   O runner roda como o usuário `dti` (não-root) e usa uma ServiceAccount
+#   dedicada (`gha-deployer`, criada fora deste repositório — ver runbook
+#   na seção 8 do README) com RBAC escopado APENAS ao namespace
+#   `authentication` (mais permissão para gerenciar a própria Namespace e
+#   a StorageClass/ClusterRole de cluster-admin do Portainer, que também
+#   são recursos de escopo de cluster que este pipeline precisa criar/
+#   atualizar). Antes desta auditoria, o runner usava o kubeconfig admin
+#   completo do K3s (`/etc/rancher/k3s/k3s.yaml`), com `cluster-admin`
+#   sobre o cluster INTEIRO — um comprometimento do pipeline (ou de uma
+#   Action de terceiro, se algum dia uma for adicionada) equivalia a
+#   controle total do cluster, não só desta stack.
 # ==============================================================================
 
 name: Deploy Auth Stack para o K3s
@@ -86,9 +99,11 @@ jobs:
     # ↑ ⭐ O CORAÇÃO DA SEGURANÇA DESTE PIPELINE ⭐
     #   Em vez de "ubuntu-latest" (máquina da GitHub), usamos "self-hosted"
     #   para rodar este job DENTRO da própria VM K3s da prefeitura — o
-    #   `kubectl` já está local, autenticado no cluster local, sem precisar
-    #   trafegar credenciais de acesso pela internet.
-    #   (Veja o README.md para o passo a passo de registro do runner.)
+    #   `kubectl` já está local, autenticado no cluster local (hoje, via um
+    #   kubeconfig escopado ao namespace `authentication` — ver nota de
+    #   segurança no cabeçalho deste arquivo), sem precisar trafegar
+    #   credenciais de acesso pela internet. (Veja o README.md para o
+    #   passo a passo de registro do runner.)
 
     timeout-minutes: 20
     # ↑ Mata o job automaticamente se travar além deste tempo — evita que
@@ -99,7 +114,7 @@ jobs:
     #   este teto geral mata a pipeline ANTES de um passo individual sequer
     #   ter chance de reportar seu próprio erro — ajustado de 10 para 20min
     #   quando o timeout do passo de federação subiu de 120s para 300s (ver
-    #   comentário no passo 13).
+    #   comentário no passo de federação, mais abaixo).
 
     steps:
       # ↑ Lista ORDENADA de passos executados sequencialmente dentro do job.
@@ -128,19 +143,36 @@ jobs:
         #   rodar primeiro, os passos seguintes falham com erro
         #   "namespaces authentication not found".
 
-      - name: 4. Aplicar Secrets (credenciais)
+      - name: 4. Aplicar StorageClass (local-path-retain)
+        run: kubectl apply -f k3s-cluster/storageclass.yaml
+        # ↑ 🔒 Passo novo (auditoria ago/2026). Recurso de escopo de
+        #   CLUSTER (não fica dentro de nenhum namespace), por isso é
+        #   aplicado cedo, junto com o Namespace — antes de qualquer PVC
+        #   que possa vir a usá-la (hoje, só `vaultwarden-backup-pvc`; ver
+        #   `storageclass.yaml` para o porquê dos 3 PVCs mais antigos não
+        #   usarem esta classe).
+
+      - name: 5. Aplicar ResourceQuota e LimitRange do namespace
+        run: kubectl apply -f k3s-cluster/resource-quota.yaml
+        # ↑ 🔒 Passo novo (auditoria ago/2026). Aplicado cedo, antes de
+        #   qualquer Deployment/Job existir no namespace — não bloqueia
+        #   nada retroativamente (a ResourceQuota só entra em vigor para
+        #   objetos criados A PARTIR de agora), mas já protege os passos
+        #   seguintes deste mesmo deploy.
+
+      - name: 6. Aplicar Secrets (credenciais)
         run: kubectl apply -f k3s-cluster/secrets.yaml
         # ↑ Aplicado logo em seguida, pois o PostgreSQL, o Keycloak e o
         #   Vaultwarden (próximos passos) dependem destas credenciais via
         #   `secretKeyRef` para conseguirem sequer INICIAR.
 
-      - name: 5. Aplicar PostgreSQL (PVC + Deployment + Service)
+      - name: 7. Aplicar PostgreSQL (PVC + Deployment + Service)
         run: kubectl apply -f k3s-cluster/postgres-db.yaml
         # ↑ O arquivo postgres-db.yaml já contém o PVC (disco), o Deployment
         #   e o Service num único apply — o Kubernetes cria os 3 objetos na
         #   ordem correta internamente (PVC antes do Pod que o consome).
 
-      - name: 6. Aguardar o PostgreSQL ficar pronto
+      - name: 8. Aguardar o PostgreSQL ficar pronto
         run: |
           kubectl rollout status deployment/postgres \
             -n authentication --timeout=120s
@@ -150,7 +182,7 @@ jobs:
         #   banco estar realmente pronto faria os Pods dele entrarem em
         #   CrashLoopBackOff nas primeiras tentativas de conexão.
 
-      - name: 7. Aplicar NetworkPolicy (restringe acesso ao Postgres)
+      - name: 9. Aplicar NetworkPolicy de Ingress (restringe acesso ao Postgres)
         run: kubectl apply -f k3s-cluster/network-policy.yaml
         # ↑ Aplicado logo após o Postgres existir, e ANTES do Keycloak, para
         #   que a regra "só o Keycloak pode falar com o banco" já esteja no
@@ -158,37 +190,53 @@ jobs:
         #   (Funciona em qualquer K3s — ver aviso sobre CNI/enforcement
         #   dentro do próprio arquivo network-policy.yaml.)
 
-      - name: 8. Aplicar CronJob de backup do PostgreSQL
+      - name: 10. Aplicar NetworkPolicy de Egress (restringe saída de cada Pod)
+        run: kubectl apply -f k3s-cluster/network-policy-egress.yaml
+        # ↑ 🔒 Passo novo (auditoria ago/2026) — ver
+        #   `network-policy-egress.yaml` para o racional completo de cada
+        #   regra e o aviso sobre por que a regra de DNS é obrigatória em
+        #   toda policy. Aplicado junto com a policy de Ingress, pelo mesmo
+        #   motivo: o Postgres (alvo das regras de egress mais simples) já
+        #   existe neste ponto da pipeline.
+
+      - name: 11. Aplicar CronJob de backup do PostgreSQL
         run: kubectl apply -f k3s-cluster/postgres-backup-cronjob.yaml
         # ↑ Cria o PVC dedicado de backup e agenda o `pg_dump` diário às
         #   03:00 (America/Cuiaba). Aplicado aqui pois já depende do
-        #   Secret (passo 4) para as credenciais de conexão, e é
+        #   Secret (passo 6) para as credenciais de conexão, e é
         #   independente do Keycloak/Vaultwarden em si.
 
-      - name: 9. Aplicar tema visual customizado do Keycloak (ConfigMap)
+      - name: 12. Aplicar tema visual customizado do Keycloak (ConfigMap)
         run: kubectl apply -f k3s-cluster/keycloak-theme.yaml
         # ↑ ANTES do Deployment do Keycloak (próximo passo) de propósito:
         #   o Deployment monta este ConfigMap como volume — se ele não
         #   existir ainda, os Pods ficam travados em "ContainerCreating"
         #   esperando um volume inexistente.
 
-      - name: 10. Aplicar Keycloak (Service headless + Deployment + Services)
+      - name: 13. Aplicar Keycloak (Service headless + Deployment + Services)
         run: kubectl apply -f k3s-cluster/keycloak.yaml
         # ↑ Cria o Service headless (usado pelo DNS_PING para o clustering
         #   entre as 2 réplicas), o Deployment do Keycloak (já apontando
-        #   para o Postgres, garantido pronto no passo 6, e para o tema
+        #   para o Postgres, garantido pronto no passo 8, e para o tema
         #   customizado do passo anterior), o Service ClusterIP interno E
         #   o Service LoadBalancer que expõe a porta 18443 na VM — a MESMA
         #   porta que o Keycloak antigo usava, para o Nginx da borda não
         #   precisar de nenhuma alteração de config (ver `nginx-edge/README.md`).
 
-      - name: 11. Aplicar Vaultwarden (PVC + Deployment + Services)
+      - name: 14. Aplicar Vaultwarden (PVC + Deployment + Services)
         run: kubectl apply -f k3s-cluster/vaultwarden.yaml
         # ↑ Mesmo raciocínio do Keycloak: inclui o Service LoadBalancer que
         #   expõe a porta 8081 na VM, a mesma porta que o Vaultwarden
         #   antigo já usava.
 
-      - name: 12. Aguardar Keycloak e Vaultwarden ficarem prontos
+      - name: 15. Aplicar CronJob de backup do Vaultwarden
+        run: kubectl apply -f k3s-cluster/vaultwarden-backup-cronjob.yaml
+        # ↑ 🔒 Passo novo (auditoria ago/2026) — ver
+        #   `vaultwarden-backup-cronjob.yaml`. Precisa vir DEPOIS do passo
+        #   anterior (Vaultwarden), pois monta o mesmo PVC (`vaultwarden-pvc`)
+        #   criado por ele, em modo somente leitura.
+
+      - name: 16. Aguardar Keycloak e Vaultwarden ficarem prontos
         run: |
           kubectl rollout status deployment/keycloak \
             -n authentication --timeout=300s
@@ -205,7 +253,7 @@ jobs:
         #   passo estourar o tempo — é só a CONFIRMAÇÃO da pipeline que
         #   ficaria imprecisa com um timeout curto demais).
 
-      - name: 13. Configurar federação com o Active Directory
+      - name: 17. Configurar federação com o Active Directory
         run: |
           if ! kubectl get secret ad-bind-credentials -n authentication > /dev/null 2>&1; then
             echo "AVISO: Secret 'ad-bind-credentials' ainda não existe."
@@ -239,11 +287,11 @@ jobs:
         #   tempo", MESMO com o Job terminando com sucesso segundos depois
         #   por conta própria. Esse timeout curto sempre existiu, mas antes
         #   ficava mascarado pelo bug do `kubectl wait \|\| kubectl logs`
-        #   (ver linha correspondente na seção 8 do README) — corrigir um
-        #   escondia o outro. 300s alinha com o `activeDeadlineSeconds: 300`
-        #   já definido no próprio `ldap-federation-job.yaml` (o teto real
-        #   que o Job se dá antes de ser morto), então os dois números agora
-        #   contam a mesma história.
+        #   (ver a seção 8 do README) — corrigir um escondia o outro. 300s
+        #   alinha com o `activeDeadlineSeconds: 300` já definido no
+        #   próprio `ldap-federation-job.yaml` (o teto real que o Job se dá
+        #   antes de ser morto), então os dois números agora contam a
+        #   mesma história.
         # ↑ Este passo é TOLERANTE só a UM tipo específico de "falha": os
         #   Secrets `ad-bind-credentials` e `keycloak-admin-credentials`
         #   ainda não existirem (checado acima, com `exit 0`) — porque os
@@ -258,9 +306,9 @@ jobs:
         #   quando a federação com o AD estava genuinamente quebrada —
         #   escondendo o problema tanto do painel do GitHub Actions quanto
         #   de qualquer alerta baseado em falha de pipeline. Agora, o passo
-        #   14 (que roda sempre, via `if: always()`) ainda mostra o estado
-        #   final do cluster para diagnóstico, mas o workflow como um todo
-        #   fica corretamente marcado como FALHO quando isso acontece.
+        #   final (que roda sempre, via `if: always()`) ainda mostra o
+        #   estado final do cluster para diagnóstico, mas o workflow como um
+        #   todo fica corretamente marcado como FALHO quando isso acontece.
         #   `kubectl delete` antes do `apply`: Jobs do Kubernetes são
         #   IMUTÁVEIS depois de criados — sem apagar primeiro, reaplicar um
         #   Job já existente com o mesmo nome falharia. Apagar e recriar a
@@ -269,7 +317,18 @@ jobs:
         #   interna do Job é idempotente (verifica antes de criar), então
         #   rodar de novo em todo deploy é seguro e não duplica nada.
 
-      - name: 14. Resumo final do estado do cluster
+      - name: 18. Aplicar Portainer (namespace, RBAC, Deployment, Service)
+        run: kubectl apply -f k3s-cluster/portainer.yaml
+        # ↑ 🔒 Passo novo (auditoria ago/2026) — Portainer já rodava no
+        #   cluster desde antes, aplicado manualmente; movido para dentro
+        #   do GitOps nesta auditoria (ver cabeçalho de `portainer.yaml`
+        #   para o porquê e as duas mudanças de segurança feitas em cima
+        #   do manifesto oficial). Independente do resto da stack de
+        #   autenticação — colocado por último de propósito, para uma
+        #   eventual falha aqui nunca impedir o Keycloak/Postgres/
+        #   Vaultwarden (o que realmente importa) de serem atualizados.
+
+      - name: 19. Resumo final do estado do cluster
         if: always()
         # ↑ `if: always()` faz este passo rodar SEMPRE, mesmo se algum passo
         #   anterior tiver falhado — útil para diagnóstico rápido direto
@@ -279,5 +338,7 @@ jobs:
           kubectl get pods -n authentication -o wide
           echo "----- Services no namespace authentication (confira as portas 18443/8081) -----"
           kubectl get svc -n authentication -o wide
-          echo "----- CronJob de backup -----"
+          echo "----- CronJobs de backup -----"
           kubectl get cronjob -n authentication
+          echo "----- Portainer -----"
+          kubectl get pods -n portainer -o wide

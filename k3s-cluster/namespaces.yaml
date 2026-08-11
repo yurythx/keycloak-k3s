@@ -10,9 +10,17 @@
 #   1. ISOLAMENTO: evita colisão de nomes com outras aplicações do cluster
 #      (ex.: se amanhã a prefeitura subir um Grafana, ele não vai brigar de
 #      nome com nada aqui dentro).
-#   2. SEGURANÇA (RBAC): permitimos que a ServiceAccount do Keycloak (usada
-#      para descoberta de cluster via KUBE_PING) só tenha permissão de listar
-#      Pods DENTRO deste namespace, e não no cluster inteiro.
+#   2. SEGURANÇA (isolamento): as NetworkPolicies de Ingress/Egress deste
+#      projeto (ver `network-policy.yaml` e `network-policy-egress.yaml`)
+#      só enxergam Pods DENTRO deste namespace por padrão.
+#      ⚠️ CORRIGIDO em auditoria (ago/2026): este item mencionava uma
+#      ServiceAccount+RBAC do Keycloak para descoberta via "KUBE_PING" —
+#      isso descreve uma abordagem ANTIGA e ABANDONADA (ver a correção
+#      documentada na seção 8 do README e o cabeçalho de `keycloak.yaml`):
+#      o clustering do Keycloak usa DNS_PING hoje, que não depende da API
+#      do Kubernetes nem de nenhum RBAC — não existe mais nenhuma
+#      ServiceAccount dedicada ao Keycloak neste projeto. Comentário
+#      nunca tinha sido atualizado depois da mudança de mecanismo.
 #   3. ORGANIZAÇÃO E LIMPEZA: comandos como `kubectl get all -n authentication`
 #      mostram só o que interessa, e `kubectl delete namespace authentication`
 #      remove a stack inteira de uma vez, sem deixar resíduos.
