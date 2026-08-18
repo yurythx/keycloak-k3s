@@ -388,8 +388,8 @@ spec:
               echo ">> Ativando idioma Português (Brasil) na tela de login do realm..."
               "$KCADM" update "realms/$TARGET_REALM" \
                 -s internationalizationEnabled=true \
-                -s 'supportedLocales=["pt_BR"]' \
-                -s defaultLocale=pt_BR
+                -s 'supportedLocales=["pt-BR"]' \
+                -s defaultLocale=pt-BR
               # ↑ 🐛 CAUSA REAL do login aparecer em inglês: o tema base
               #   `keycloak.v2` (herdado por `prefeitura`, ver
               #   keycloak-theme.yaml) já vem com as traduções pt_BR
@@ -399,7 +399,24 @@ spec:
               #   ligado E o idioma listado em `supportedLocales`. Sem
               #   isso, TODO realm novo nasce só em inglês, texto nenhum
               #   customizado — não é um problema do tema visual em si.
-              #   Como só listamos 1 idioma (`pt_BR`), a tela de login não
+              #
+              #   ⚠️ "pt-BR" (HÍFEN), não "pt_BR" (underscore) — mesmo o
+              #   ARQUIVO de tradução se chamando `messages_pt_BR.properties`
+              #   (convenção Java, underscore). Confirmado extraindo de
+              #   verdade `org.keycloak.keycloak-themes-26.7.0.jar` (mesma
+              #   técnica usada pro logo — ver keycloak-theme.yaml):
+              #   `theme/base/login/theme.properties` declara
+              #   `locales=...,pt,pt-BR,...` — com HÍFEN. O Keycloak cruza
+              #   `supportedLocales` do realm com essa lista do tema; se o
+              #   formato não bate exatamente (ex.: "pt_BR" com underscore,
+              #   o erro original desta correção), a interseção fica vazia
+              #   e ele volta pro inglês por padrão — silenciosamente, sem
+              #   erro nenhum no `kcadm` (por isso o Job "funcionava" mas o
+              #   idioma continuava em inglês). Reproduzido ao vivo: mesmo
+              #   forçando `?ui_locales=pt_BR` na URL manualmente, a página
+              #   continuava em inglês; só com `pt-BR` (hífen) funciona.
+              #
+              #   Como só listamos 1 idioma (`pt-BR`), a tela de login não
               #   ganha um seletor de idioma (esse dropdown só aparece com
               #   2+ idiomas em `supportedLocales`) — fica direto em
               #   português, sem opção de trocar, que é o comportamento
