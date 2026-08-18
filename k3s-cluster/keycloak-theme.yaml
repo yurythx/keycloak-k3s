@@ -112,6 +112,44 @@ data:
       border-radius: 4px;
       text-indent: -9999px;
       overflow: hidden;
+
+      /* --- FIX: logo ia para o canto direito em tela maximizada --------
+         `background-position: center` só centraliza a imagem DENTRO da
+         caixa do próprio elemento — se a caixa em si não ocupa 100% da
+         largura do cabeçalho (ex.: por estar dentro de um contêiner flex
+         do tema base `keycloak.v2`, que reserva espaço ao lado para um
+         seletor de idioma e encolhe o filho pro tamanho do conteúdo em
+         telas largas), o resultado visual é a caixa inteira — logo
+         incluso — deslocada pro canto, não centralizada na página.
+         Forçamos a caixa a sempre ocupar 100% da largura disponível,
+         independente de como o pai a dimensiona. */
+      width: 100% !important;
+      max-width: 100% !important;
+      box-sizing: border-box !important;
+      float: none !important;
+      margin: 0 auto !important;
+    }
+
+    /* Reforço: se o CONTÊINER PAI de #kc-header-wrapper usa flexbox (é o
+       caso mais provável no tema base `keycloak.v2` — reserva espaço
+       para o seletor de idioma ao lado do cabeçalho quando o realm tem
+       mais de um idioma habilitado), ele pode alinhar o filho pro início
+       ou fim do eixo mesmo o filho tendo 100% de largura "disponível",
+       dependendo de como esse espaço é calculado. Cobrimos o caso mais
+       provável (o próprio #kc-header) com seletores amplos; regra para
+       um seletor que não existir no DOM real simplesmente não faz nada,
+       não quebra o resto do tema.
+       ⚠️ Não tivemos acesso ao cluster nesta rodada pra inspecionar o
+       HTML renderizado de verdade (como fizemos da primeira vez, via
+       `kubectl exec` no Pod — ver cabeçalho deste arquivo) e confirmar o
+       nome exato da classe do contêiner pai — esta parte é defensiva/
+       best-effort. Se depois do rollout restart o logo AINDA não vier
+       centralizado, mande um print da tela maximizada (ou o HTML via
+       "Ver código-fonte da página") que a gente ajusta o seletor certo. */
+    #kc-header {
+      display: flex !important;
+      justify-content: center !important;
+      width: 100% !important;
     }
 
 binaryData:

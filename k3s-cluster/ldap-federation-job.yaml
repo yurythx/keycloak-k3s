@@ -385,6 +385,27 @@ spec:
               #   — troque o CONTEÚDO daquele arquivo para mudar cores/logo,
               #   não este comando.
 
+              echo ">> Ativando idioma Português (Brasil) na tela de login do realm..."
+              "$KCADM" update "realms/$TARGET_REALM" \
+                -s internationalizationEnabled=true \
+                -s 'supportedLocales=["pt_BR"]' \
+                -s defaultLocale=pt_BR
+              # ↑ 🐛 CAUSA REAL do login aparecer em inglês: o tema base
+              #   `keycloak.v2` (herdado por `prefeitura`, ver
+              #   keycloak-theme.yaml) já vem com as traduções pt_BR
+              #   embutidas — mas o Keycloak só usa qualquer idioma que
+              #   não seja o inglês (nem detecta o idioma do navegador do
+              #   usuário) se o realm tiver `internationalizationEnabled`
+              #   ligado E o idioma listado em `supportedLocales`. Sem
+              #   isso, TODO realm novo nasce só em inglês, texto nenhum
+              #   customizado — não é um problema do tema visual em si.
+              #   Como só listamos 1 idioma (`pt_BR`), a tela de login não
+              #   ganha um seletor de idioma (esse dropdown só aparece com
+              #   2+ idiomas em `supportedLocales`) — fica direto em
+              #   português, sem opção de trocar, que é o comportamento
+              #   desejado aqui. Idempotente, mesmo padrão do `loginTheme`
+              #   acima.
+
               echo ">> Concluído."
           # ↑ Fim do script. Nota sobre os campos do provider (todos com
           #   comentário porque cada um foi verificado antes de usar, não
