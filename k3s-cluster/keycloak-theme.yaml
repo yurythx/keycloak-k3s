@@ -151,6 +151,33 @@ data:
       }
     }
 
+  # ----------------------------------------------------------------------
+  # messages_pt_BR.properties — sobrescreve só os textos de título da
+  # tela de login (pedido específico da prefeitura: "Entrar no Domínio
+  # Rondonópolis" em vez do texto genérico padrão).
+  # ----------------------------------------------------------------------
+  messages_pt_BR.properties: |
+    # Este arquivo só precisa ter as chaves que queremos SOBRESCREVER —
+    # o Keycloak mescla com as ~1000 chaves do tema pai (`keycloak.v2` →
+    # `base`) automaticamente; tudo que não está aqui continua traduzido
+    # normalmente pela tradução pt_BR nativa do Keycloak (já confirmada
+    # funcionando — ver ldap-federation-job.yaml para o porquê de
+    # `supportedLocales` precisar ser "pt-BR", com hífen).
+    #
+    # Nomes das chaves confirmados extraindo de verdade
+    # `theme/base/login/messages/messages_pt_BR.properties` de dentro de
+    # `org.keycloak.keycloak-themes-26.7.0.jar` (mesma técnica já usada
+    # pro logo e pro fix do CSS — não foi chute):
+    #   loginAccountTitle — título GRANDE (<h1>) visível na tela, logo
+    #     acima do formulário de usuário/senha. Original:
+    #     "Entrar na sua conta". É este que a prefeitura pediu pra trocar.
+    #   loginTitle — texto da ABA do navegador (<title>), formato
+    #     "Entrar em {0}" onde {0} é o nome do realm. Sobrescrito como
+    #     string fixa (sem {0}) pra ficar consistente com o título da
+    #     tela.
+    loginAccountTitle=Entrar no Domínio Rondonópolis
+    loginTitle=Entrar no Domínio Rondonópolis
+
 binaryData:
   # ----------------------------------------------------------------------
   # logo.png — brasão + "PREFEITURA DE RONDONÓPOLIS", processado a partir

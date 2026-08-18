@@ -446,6 +446,14 @@ spec:
               # ↑ Logo real da prefeitura (brasão + "PREFEITURA DE
               #   RONDONÓPOLIS"), processado para PNG com transparência —
               #   ver histórico completo em keycloak-theme.yaml.
+            - name: theme-prefeitura
+              mountPath: /opt/keycloak/themes/prefeitura/login/messages/messages_pt_BR.properties
+              subPath: messages_pt_BR.properties
+              # ↑ Sobrescreve só 2 chaves de texto (título da aba do
+              #   navegador e o cabeçalho "Entrar em sua conta" da tela de
+              #   login) para o texto customizado da prefeitura — ver
+              #   keycloak-theme.yaml para a explicação completa de como
+              #   confirmamos os nomes exatos dessas chaves.
 
       volumes:
         - name: theme-prefeitura
