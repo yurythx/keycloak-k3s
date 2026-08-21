@@ -34,6 +34,13 @@
 #   ver seção 9 do README para o racional completo e o motivo de ter
 #   ficado pendente (risco real de quebrar a própria pipeline de deploy
 #   se a RBAC ficar mal calibrada, sem uma janela dedicada para testar).
+#   🔒 `k3s-cluster/rbac-deployer.yaml` (auditoria ago/2026) já contém o
+#   ServiceAccount/Role/ClusterRole propostos para essa troca, PRONTOS
+#   para aplicar — mas ainda NÃO estão ligados a este workflow (trocar o
+#   kubeconfig do runner é um passo manual, com teste isolado recomendado
+#   antes; ver "COMO ATIVAR" no final daquele arquivo, incluindo a
+#   ressalva sobre o step 18/Portainer, que precisa de uma credencial
+#   separada mesmo depois dessa troca).
 # ==============================================================================
 
 name: Deploy Auth Stack para o K3s

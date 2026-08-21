@@ -16,23 +16,30 @@
 #   provider já existem antes de criar — pode ser reaplicado quantas vezes
 #   quiser (inclusive a cada deploy da pipeline) sem duplicar nada nem falhar.
 #
-# ⚠️ POR QUE A SENHA DA CONTA DO AD NÃO ESTÁ EM NENHUM ARQUIVO VERSIONADO
-#   A conta usada aqui (`<conta-servico-ad>`, ver AD_BIND_DN em `secrets.yaml`) é uma
-#   conta ADMINISTRATIVA DO DOMÍNIO — bem mais sensível que qualquer outra
-#   credencial desta stack (um vazamento afeta o Active Directory inteiro
-#   da prefeitura, não só este cluster). Por isso a senha dela vive em um
-#   Secret SEPARADO (`ad-bind-credentials`), que NENHUM manifesto deste
-#   repositório cria — você precisa criá-lo manualmente, uma única vez,
-#   DIRETO no cluster (nunca commitado):
+# ⚠️ POR QUE A SENHA *E* O DN DA CONTA DO AD NÃO ESTÃO EM NENHUM ARQUIVO
+#   VERSIONADO (auditoria de segurança ago/2026)
+#   A conta usada aqui é uma conta ADMINISTRATIVA DO DOMÍNIO — bem mais
+#   sensível que qualquer outra credencial desta stack (um vazamento afeta
+#   o Active Directory inteiro da prefeitura, não só este cluster). Até
+#   ago/2026, só a SENHA vivia fora do Git (Secret separado) — o DN
+#   completo (usuário + estrutura de OUs do domínio) ficava versionado em
+#   `secrets.yaml`, em texto claro, num repositório PÚBLICO. Isso por si só
+#   já é reconhecimento valioso para um atacante (nome de conta privilegiada
+#   válido + caminho exato no diretório), mesmo sem a senha. Por isso o DN
+#   foi MOVIDO para o mesmo Secret separado que já guardava a senha —
+#   `ad-bind-credentials` —, que NENHUM manifesto deste repositório cria —
+#   você precisa criá-lo manualmente, uma única vez, DIRETO no cluster
+#   (nunca commitado):
 #
 #     kubectl create secret generic ad-bind-credentials \
 #       --namespace authentication \
-#       --from-literal=AD_BIND_PASSWORD='SENHA_REAL_DA_CONTA_ADM_YURI'
+#       --from-literal=AD_BIND_DN='CN=...,OU=...,DC=...,DC=...' \
+#       --from-literal=AD_BIND_PASSWORD='SENHA_REAL_DA_CONTA_DE_BIND'
 #
 #   Depois de criado uma vez, este Job (e a pipeline, que reaplica este
 #   arquivo a cada deploy) continuam funcionando normalmente — ninguém
-#   além de quem tem acesso ao cluster jamais vê essa senha em texto
-#   claro fora dele. Se precisar trocar a senha desta conta no AD no
+#   além de quem tem acesso ao cluster jamais vê essa senha (nem o DN) em
+#   texto claro fora dele. Se precisar trocar a senha desta conta no AD no
 #   futuro, rode o mesmo comando acima de novo (ele substitui o Secret
 #   existente) e depois: `kubectl delete job ldap-federation-setup -n
 #   authentication` seguido de `kubectl apply -f k3s-cluster/ldap-federation-job.yaml`
@@ -443,7 +450,8 @@ spec:
           #                                 abaixo do usersDn — necessário
           #                                 aqui, já que os usuários ficam
           #                                 vários níveis abaixo (ver
-          #                                 AD_BIND_DN em secrets.yaml).
+          #                                 AD_BIND_DN no Secret manual
+          #                                 `ad-bind-credentials`).
           #     editMode=READ_ONLY       -> Keycloak nunca tenta ESCREVER
           #                                 de volta no AD (ex.: trocar
           #                                 senha) — mudanças de senha
@@ -510,7 +518,15 @@ spec:
             - name: AD_BIND_DN
               valueFrom:
                 secretKeyRef:
-                  name: auth-stack-credentials
+                  name: ad-bind-credentials
+                  # ↑ 🔒 Movido de `auth-stack-credentials` (secrets.yaml,
+                  #   versionado) para cá em ago/2026: o DN completo é
+                  #   usuário + estrutura de OUs do domínio, reconhecimento
+                  #   valioso para um atacante mesmo sem a senha, e este
+                  #   repositório é público. Agora vive no mesmo Secret
+                  #   SEPARADO e não-versionado que já guardava a senha —
+                  #   ver aviso no topo deste arquivo para o comando de
+                  #   criação manual.
                   key: AD_BIND_DN
 
             - name: AD_BIND_PASSWORD

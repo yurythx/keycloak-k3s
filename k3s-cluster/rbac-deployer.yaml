@@ -1,0 +1,216 @@
+# ==============================================================================
+# ARQUIVO: k3s-cluster/rbac-deployer.yaml
+# ------------------------------------------------------------------------------
+# 🔒 ARQUIVO NOVO — criado em auditoria de segurança (ago/2026)
+#
+# OBJETIVO
+#   Dar ao runner self-hosted do GitHub Actions (`.github/workflows/deploy.yml`)
+#   uma identidade ESCOPADA ao namespace `authentication` (+ os poucos
+#   recursos de escopo de cluster que a pipeline realmente usa: Namespace e
+#   StorageClass), em vez do kubeconfig admin completo (`cluster-admin`
+#   sobre o cluster INTEIRO) que o runner usa hoje — ver a nota de
+#   segurança no cabeçalho de `deploy.yml`.
+#
+#   Por que isso importa: hoje, comprometer o pipeline (ou uma Action de
+#   terceiro adicionada no futuro) equivale a controle total do cluster —
+#   inclusive `kube-system` e o namespace `portainer`, que nada têm a ver
+#   com a stack de autenticação. Com este RBAC, o mesmo comprometimento
+#   fica limitado ao namespace `authentication` (+ criar/editar Namespace
+#   e StorageClass, ações de baixo risco por si só).
+#
+# ⚠️ ESTE ARQUIVO É UMA PROPOSTA — AINDA NÃO ESTÁ LIGADO AO RUNNER
+#   Criar este ServiceAccount/Role/RoleBinding no cluster (`kubectl apply
+#   -f k3s-cluster/rbac-deployer.yaml`) NÃO muda, sozinho, qual credencial
+#   o runner usa — isso é um passo MANUAL, fora do alcance desta sessão
+#   (exige acesso à VM/cluster de produção). Ver "COMO ATIVAR" no final
+#   deste arquivo para o passo a passo completo.
+#
+#   Testar numa janela de manutenção dedicada ANTES de trocar o kubeconfig
+#   do runner em definitivo — é exatamente o risco que fez esta correção
+#   ficar pendente na auditoria original (ver `deploy.yml`): uma RBAC mal
+#   calibrada quebra a pipeline de deploy inteira, e o único jeito de
+#   corrigir de volta, sem acesso admin já configurado em outro lugar,
+#   seria mexer direto na VM.
+#
+# ⚠️ LIMITAÇÃO CONHECIDA — O PASSO DO PORTAINER (step 18 do deploy.yml)
+#   `k3s-cluster/portainer.yaml` cria um `ClusterRoleBinding` concedendo
+#   `cluster-admin` à ServiceAccount do próprio Portainer (ver cabeçalho
+#   daquele arquivo para o porquê). Por regra do próprio Kubernetes
+#   (prevenção de escalação de privilégio), SÓ um sujeito que já tem
+#   permissão de `bind`/`escalate` sobre `ClusterRole cluster-admin` (ou é
+#   ele mesmo `cluster-admin`) pode criar esse `ClusterRoleBinding` — ou
+#   seja, o Role escopado abaixo NÃO é suficiente para aplicar
+#   `portainer.yaml`. Duas opções, nenhuma aplicada ainda (decisão de
+#   produto, não só técnica):
+#     a) Manter esse UM step do workflow (18) usando o kubeconfig admin
+#        completo (ou uma identidade separada com permissão só de
+#        `bind`/`escalate` em `cluster-admin`), com o restante do
+#        pipeline (steps 1–17, a stack de autenticação de verdade) já
+#        rodando com a identidade escopada deste arquivo — reduz o raio
+#        de exposição na maior parte da pipeline, mesmo sem eliminá-lo
+#        por completo.
+#     b) Mover o deploy do Portainer para um workflow/runner totalmente
+#        separado do da stack de autenticação, com sua própria
+#        credencial admin — a stack de autenticação nunca precisa de
+#        cluster-admin em nenhum momento.
+#   Ver seção "COMO ATIVAR" para o comando de teste isolado antes de
+#   decidir.
+# ==============================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: authstack-deployer
+  namespace: authentication
+  labels:
+    app.kubernetes.io/part-of: prefeitura-auth-stack
+    app.kubernetes.io/managed-by: github-actions
+  # ↑ Identidade que o runner vai USAR (via token desta ServiceAccount),
+  #   em vez do usuário admin do kubeconfig atual. Vive DENTRO do
+  #   namespace que ela mesma administra — não precisa existir em
+  #   `kube-system` nem em nenhum outro lugar.
+
+---
+# ------------------------------------------------------------------------------
+# Role: tudo que a pipeline aplica DENTRO do namespace "authentication"
+# (steps 6 a 17 do deploy.yml: Secrets, PostgreSQL, NetworkPolicies,
+# CronJobs, ConfigMap do tema, Keycloak, Vaultwarden, Job de federação).
+# ------------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: authstack-deployer-role
+  namespace: authentication
+  labels:
+    app.kubernetes.io/part-of: prefeitura-auth-stack
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "services", "configmaps", "persistentvolumeclaims", "resourcequotas", "limitranges", "pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # ↑ "pods"/"pods/log" com escopo de LEITURA seria suficiente para o
+    #   step 19 (resumo final, "kubectl get pods -o wide") — mantido com
+    #   os mesmos verbos dos demais por simplicidade; se quiser reduzir
+    #   ainda mais, separe "pods"/"pods/log" num Role só de leitura.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # ↑ "jobs" com delete: o step 17 roda `kubectl delete job
+    #   ldap-federation-setup --ignore-not-found` antes de recriar (Jobs
+    #   são imutáveis) — sem "delete" aqui, aquele step quebra.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: authstack-deployer-binding
+  namespace: authentication
+  labels:
+    app.kubernetes.io/part-of: prefeitura-auth-stack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: authstack-deployer-role
+subjects:
+  - kind: ServiceAccount
+    name: authstack-deployer
+    namespace: authentication
+
+---
+# ------------------------------------------------------------------------------
+# ClusterRole + ClusterRoleBinding: só os DOIS recursos de escopo de
+# CLUSTER que a pipeline realmente usa (steps 3 e 4) — Namespace (o
+# próprio "authentication") e StorageClass (`local-path-retain`). Nenhum
+# dos dois concede acesso a outros namespaces ou a RBAC/Secrets fora daqui.
+# ------------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: authstack-deployer-cluster-role
+  labels:
+    app.kubernetes.io/part-of: prefeitura-auth-stack
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["authentication"]
+    verbs: ["get", "update", "patch"]
+    # ↑ Sem "create"/"delete": o Namespace já existe depois do primeiro
+    #   deploy — reaplicar `namespaces.yaml` só faz `get`+`patch`. Se um
+    #   dia recriar o cluster do ZERO, o primeiro `kubectl apply -f
+    #   namespaces.yaml` precisa rodar com uma credencial admin uma única
+    #   vez (igual ao "bootstrap" de qualquer cluster novo) — depois disso
+    #   a pipeline volta a usar esta identidade escopada normalmente.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    resourceNames: ["local-path-retain"]
+    verbs: ["get", "update", "patch"]
+    # ↑ Mesma lógica do Namespace acima: StorageClass é criada uma vez no
+    #   bootstrap, os deploys seguintes só confirmam que já existe.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: authstack-deployer-cluster-binding
+  labels:
+    app.kubernetes.io/part-of: prefeitura-auth-stack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: authstack-deployer-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: authstack-deployer
+    namespace: authentication
+
+# ==============================================================================
+# COMO ATIVAR (passo a passo manual — exige acesso à VM/cluster; nada
+# disto roda sozinho só por este arquivo existir no Git):
+#
+#   1. Com o kubeconfig ADMIN atual (o mesmo que o runner já usa hoje),
+#      aplique este arquivo uma vez:
+#        kubectl apply -f k3s-cluster/rbac-deployer.yaml
+#
+#   2. Gere um kubeconfig que autentica como a ServiceAccount
+#      `authstack-deployer` (token de longa duração, via Secret tipo
+#      kubernetes.io/service-account-token — a partir do K8s 1.24 não é
+#      mais criado automaticamente, precisa ser pedido explicitamente):
+#
+#        kubectl apply -n authentication -f - <<'EOF'
+#        apiVersion: v1
+#        kind: Secret
+#        metadata:
+#          name: authstack-deployer-token
+#          annotations:
+#            kubernetes.io/service-account.name: authstack-deployer
+#        type: kubernetes.io/service-account-token
+#        EOF
+#
+#        TOKEN=$(kubectl get secret authstack-deployer-token -n authentication -o jsonpath='{.data.token}' | base64 -d)
+#        CA=$(kubectl get secret authstack-deployer-token -n authentication -o jsonpath='{.data.ca\.crt}')
+#        SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+#
+#        kubectl config set-cluster k3s-authstack --server="$SERVER" --embed-certs=true --certificate-authority=<(echo "$CA" | base64 -d) --kubeconfig=/tmp/authstack.kubeconfig
+#        kubectl config set-credentials authstack-deployer --token="$TOKEN" --kubeconfig=/tmp/authstack.kubeconfig
+#        kubectl config set-context authstack-deployer --cluster=k3s-authstack --user=authstack-deployer --namespace=authentication --kubeconfig=/tmp/authstack.kubeconfig
+#        kubectl config use-context authstack-deployer --kubeconfig=/tmp/authstack.kubeconfig
+#
+#   3. TESTE ISOLADO antes de trocar o kubeconfig do runner de verdade:
+#        KUBECONFIG=/tmp/authstack.kubeconfig kubectl apply -f k3s-cluster/namespaces.yaml
+#        KUBECONFIG=/tmp/authstack.kubeconfig kubectl apply -f k3s-cluster/secrets.yaml
+#        KUBECONFIG=/tmp/authstack.kubeconfig kubectl get pods -n authentication
+#      Se algum comando falhar com "forbidden", falta um verbo/resource
+#      no Role acima — ajuste e repita o `kubectl apply` do passo 1 antes
+#      de prosseguir.
+#
+#   4. Só depois do teste isolado passar: substitua
+#      `~dti/.kube/config` (o kubeconfig que o runner self-hosted usa) por
+#      `/tmp/authstack.kubeconfig`, ajustando os steps 3, 4 e 18 do
+#      `deploy.yml` conforme a opção (a) ou (b) descrita no aviso acima
+#      sobre o Portainer.
+# ==============================================================================

@@ -242,8 +242,7 @@ A tabela abaixo é a lista completa — não há nenhum outro valor
 | Base DN dos usuários no AD | `ldap-federation-job.yaml` → `AD_USERS_DN` | `DC=rondonopolis,DC=local` | Estrutura do domínio AD **desta** prefeitura |
 | Nome do Realm de destino | `ldap-federation-job.yaml` → `TARGET_REALM` | `rondonopolis` | Escolha de nome, livre para trocar |
 | Grupos do AD com direito de admin | `ldap-federation-job.yaml` → `ADMIN_GROUP_NAMES` | `Domain Admins\|Departamento de Tecnologia da Informação` | Nomes reais de grupos **deste** AD |
-| DN da conta de bind com o AD | `secrets.yaml` → `AD_BIND_DN` | `CN=<conta-servico-ad>,OU=...,DC=rondonopolis,DC=local` | Conta e estrutura de OUs **desta** prefeitura |
-| Senha da conta de bind | Secret `ad-bind-credentials` (criado manualmente, **não** está no Git) | — | Sempre específica do ambiente, por design |
+| DN e senha da conta de bind com o AD | Secret `ad-bind-credentials` (criado manualmente, **não** está no Git — chaves `AD_BIND_DN` e `AD_BIND_PASSWORD`) | — | 🔒 Desde ago/2026 nem o DN fica versionado (antes ficava em `secrets.yaml` — revertido por revelar conta admin + estrutura de OUs num repo público). Sempre específico do ambiente, por design |
 | Senha atual do `kc_admin` (para o Job de federação) | Secret `keycloak-admin-credentials` (criado manualmente, **não** está no Git) | — | Independente do `KC_BOOTSTRAP_ADMIN_PASSWORD` de `secrets.yaml` (esse só vale no primeiro boot) — ver seção 5.6 |
 | Todas as senhas em `secrets.yaml` | `secrets.yaml` (`stringData`) | valores fictícios, claramente marcados | Devem ser geradas por ambiente — nunca reaproveitar |
 | Vhosts do Nginx de borda | `nginx-edge/*.conf` | cópia fiel dos vhosts reais desta prefeitura | Documentação/referência — **não é aplicado por este repo**; em outra rede, o Nginx (se existir) teria sua própria config, gerenciada fora deste projeto |
@@ -845,8 +844,9 @@ prontos abaixo:
   — fora da janela permitida, o Keycloak não consegue nem abrir a conexão
   LDAP, e NINGUÉM do AD consegue logar (ver seção 8). Ação recomendada:
   pedir ao time do AD uma conta de serviço dedicada, só leitura, SEM
-  restrição de horário — depois trocar `AD_BIND_DN` em `secrets.yaml` e
-  recriar o Secret `ad-bind-credentials` com a senha da nova conta.
+  restrição de horário — depois recriar o Secret `ad-bind-credentials`
+  (chaves `AD_BIND_DN` e `AD_BIND_PASSWORD`) com o DN e a senha da nova
+  conta.
 - **Sealed Secrets / SOPS**: para versionar segredos criptografados no Git
   em vez de texto plano (ver aviso detalhado em `secrets.yaml`).
 - **Backup off-site**: o CronJob já grava backups diários no disco da VM
