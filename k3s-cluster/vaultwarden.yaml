@@ -1,14 +1,13 @@
 # ==============================================================================
 # ARQUIVO: k3s-cluster/vaultwarden.yaml
 # ------------------------------------------------------------------------------
-# ⚠️ JANELA TEMPORÁRIA ABERTA (set/2026) — VER "TODO" ABAIXO
-#   SIGNUPS_ALLOWED e SIGNUPS_VERIFY foram colocados temporariamente em
-#   "true"/"false" (invertido do normal) para permitir o cadastro do
-#   primeiro usuário administrativo sem SMTP configurado (o convite pelo
-#   painel /admin não funciona sem servidor de e-mail — ver comentário
-#   nas duas variáveis abaixo). TODO: reverter os dois valores assim que
-#   o cadastro terminar, e configurar SMTP de verdade antes de convidar
-#   qualquer outro usuário no futuro.
+# 🔒 JANELA TEMPORÁRIA JÁ FECHADA (aberta e fechada em set/2026)
+#   SIGNUPS_ALLOWED e SIGNUPS_VERIFY foram brevemente invertidos para
+#   permitir o cadastro do primeiro usuário administrativo sem SMTP
+#   configurado (convite pelo painel /admin não funciona sem servidor de
+#   e-mail). Revertidos para os valores seguros padrão logo em seguida.
+#   Para convidar QUALQUER outro usuário no futuro, configure SMTP de
+#   verdade primeiro — sem isso, o mesmo problema se repete.
 #
 # OBJETIVO
 #   Subir o Vaultwarden — implementação leve (em Rust) e compatível com a API
@@ -142,26 +141,25 @@ spec:
               #   com o domínio configurado no vhost do Nginx da borda.
 
             - name: SIGNUPS_ALLOWED
-              value: "true"
-              # ↑ ⚠️ TEMPORARIAMENTE "true" (set/2026) — ver aviso no topo
-              #   deste arquivo. Deve voltar para "false" assim que o
-              #   primeiro usuário administrativo terminar de se cadastrar.
-              #   Motivo: sem SMTP configurado, convidar pelo painel /admin
-              #   não funciona (o convite fica pendente pra sempre, nenhum
-              #   e-mail é enviado, e o Vaultwarden não expõe o link do
-              #   convite por nenhum outro canal) — habilitar o cadastro
-              #   público por uma janela curta foi o único jeito de dar
-              #   acesso ao primeiro usuário sem configurar um servidor de
-              #   e-mail real primeiro.
+              value: "false"
+              # ↑ ⚠️ CONFIGURAÇÃO DE SEGURANÇA CRÍTICA para um ambiente
+              #   governamental: DESATIVA o autocadastro público. Só o
+              #   administrador (via painel /admin) pode convidar/criar
+              #   novos usuários — evita que qualquer pessoa na internet
+              #   crie uma conta no cofre da prefeitura.
+              #   🔒 Foi "true" por uma janela curta em set/2026 para o
+              #   cadastro do primeiro usuário administrativo (ver aviso no
+              #   topo do arquivo) — revertido para "false" logo em seguida.
 
             - name: SIGNUPS_VERIFY
-              value: "false"
-              # ↑ ⚠️ TEMPORARIAMENTE "false" (set/2026), pelo mesmo motivo
-              #   acima — com "true" a conta fica esperando um e-mail de
-              #   verificação que nunca chegaria (sem SMTP). Volta pra
-              #   "true" junto com o SIGNUPS_ALLOWED acima.
-              # ↑ Caso algum convite de cadastro seja enviado, exige
+              value: "true"
+              # ↑ Caso algum convite/cadastro seja processado, exige
               #   verificação de e-mail antes de liberar o acesso ao cofre.
+              #   🔒 Foi "false" por uma janela curta em set/2026 (mesmo
+              #   motivo do SIGNUPS_ALLOWED acima — sem SMTP, "true" aqui
+              #   deixaria a conta esperando pra sempre um e-mail de
+              #   verificação que nunca chegaria) — revertido para "true"
+              #   junto com o SIGNUPS_ALLOWED acima.
 
             - name: WEBSOCKET_ENABLED
               value: "true"
