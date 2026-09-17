@@ -143,12 +143,23 @@ jobs:
         #   fisicamente em disco e possam ser lidos pelo `kubectl apply`.
 
       - name: 2. Validar acesso ao cluster K3s
-        run: kubectl cluster-info
+        run: |
+          kubectl version
+          kubectl auth whoami
         # ↑ Passo de sanidade: confirma que o runner consegue "enxergar" o
         #   cluster ANTES de tentar aplicar qualquer coisa. Se o K3s
         #   estiver fora do ar ou o kubeconfig estiver mal configurado no
         #   runner, o pipeline falha AQUI, com uma mensagem de erro clara,
         #   em vez de falhar de forma confusa nos passos seguintes.
+        #   🐛 Trocado de `kubectl cluster-info` (set/2026): esse comando
+        #   lista Services em `kube-system` para montar a URL do cluster —
+        #   reproduzido ao vivo que isso quebra com a ServiceAccount
+        #   escopada do runner (`Forbidden: cannot list services ... in
+        #   namespace kube-system`), já que o RBAC do runner foi
+        #   restringido ao namespace `authentication` (ver cabeçalho deste
+        #   arquivo). `kubectl version` + `kubectl auth whoami` validam a
+        #   mesma coisa (API acessível, credencial válida) sem exigir
+        #   nenhuma permissão além de autenticação.
 
       - name: 3. Aplicar Namespace
         run: kubectl apply -f k3s-cluster/namespaces.yaml
