@@ -66,9 +66,16 @@ spec:
   # ↑ Tenta até 2 vezes antes de desistir — cobre instabilidades passageiras
   #   (ex.: Keycloak ainda terminando de subir) sem ficar tentando para sempre.
 
-  activeDeadlineSeconds: 300
-  # ↑ Mata o Job se ele travar por mais de 5 minutos — evita um Job
+  activeDeadlineSeconds: 420
+  # ↑ Mata o Job se ele travar por mais de 7 minutos — evita um Job
   #   "pendurado" bloqueando `kubectl` ou consumindo recursos indefinidamente.
+  #   🐛 Elevado de 300s para 420s (set/2026): reproduzido ao vivo — mesmo
+  #   já tendo passado por quase todo o script (realm/provider/mapeador/
+  #   grupos/usuário "prefeitura" já existentes, só faltando os 2 últimos
+  #   updates de tema/idioma), o Job foi morto por `DeadlineExceeded` aos
+  #   300s. Mesmo padrão de bug já visto no timeout do `kubectl wait` da
+  #   pipeline (ver seção 8 do README) — o número antigo (300s) veio de
+  #   uma correção anterior que também achou pouco depois de um tempo.
 
   template:
     metadata:
