@@ -19,21 +19,30 @@
 #   (inbound) precisa ser aberta no firewall da prefeitura. É o runner que
 #   "puxa" o trabalho, e não a GitHub que "empurra" para dentro da rede.
 #
-# 🔒 SOBRE O ESCOPO DE PERMISSÃO DO RUNNER (auditoria ago/2026)
-#   O runner roda como o usuário `dti` (não-root, correto) mas HOJE ainda
-#   usa o kubeconfig admin completo do K3s (`/etc/rancher/k3s/k3s.yaml`,
-#   copiado para `~dti/.kube/config`), com `cluster-admin` sobre o
-#   cluster INTEIRO (inclusive `kube-system` e o namespace `portainer`,
-#   não só `authentication`) — um comprometimento do pipeline (ou de uma
-#   Action de terceiro, se algum dia uma for adicionada) equivale hoje a
-#   controle total do cluster, não só desta stack.
-#   ⏳ PENDENTE (identificado nesta auditoria, ainda NÃO aplicado): trocar
-#   por uma ServiceAccount dedicada, com RBAC escopado ao namespace
-#   `authentication` (mais permissão pontual para gerenciar a própria
-#   Namespace e a StorageClass, que são recursos de escopo de cluster) —
-#   ver seção 9 do README para o racional completo e o motivo de ter
-#   ficado pendente (risco real de quebrar a própria pipeline de deploy
-#   se a RBAC ficar mal calibrada, sem uma janela dedicada para testar).
+# 🔒 SOBRE O ESCOPO DE PERMISSÃO DO RUNNER (auditoria ago/2026, aplicado set/2026)
+#   O runner roda como o usuário `dti` (não-root, correto). ANTES, usava o
+#   kubeconfig admin completo do K3s (`/etc/rancher/k3s/k3s.yaml`), com
+#   `cluster-admin` sobre o cluster INTEIRO — um comprometimento do
+#   pipeline equivalia a controle total do cluster, não só desta stack.
+#   ✅ CORRIGIDO (set/2026): o runner agora usa um kubeconfig SEPARADO
+#   (`KUBECONFIG` próprio no `.env` do runner, NÃO o `~/.kube/config`
+#   padrão do `dti` — esse continua admin completo, só para uso
+#   interativo/manual), autenticado como a ServiceAccount `github-runner`
+#   (namespace `authentication`), com RBAC escopado a:
+#     - Controle total (`Role`) dentro do namespace `authentication`.
+#     - Permissão pontual (`ClusterRole` com `resourceNames`) só sobre a
+#       Namespace `authentication` e a StorageClass `local-path-retain` —
+#       os 2 únicos recursos cluster-scoped que este pipeline aplica.
+#   Ver `k3s-cluster/` (objetos `ServiceAccount`/`Role`/`RoleBinding`/
+#   `ClusterRole`/`ClusterRoleBinding` `github-runner*`, aplicados
+#   manualmente — não versionados aqui de propósito, pois o Secret do
+#   token da ServiceAccount não deve ir para o Git).
+#   ⚠️ EFEITO COLATERAL DESTA MUDANÇA: o runner escopado NÃO consegue mais
+#   gerenciar o namespace `portainer` nem conceder `cluster-admin` (que é
+#   exatamente o que `portainer.yaml` faz para a própria ServiceAccount do
+#   Portainer) — por isso esse manifesto SAIU do pipeline automático (ver
+#   comentário no lugar onde o passo existia, mais abaixo) e passou a ser
+#   aplicado manualmente por um humano com o kubeconfig admin.
 # ==============================================================================
 
 name: Deploy Auth Stack para o K3s
@@ -329,22 +338,31 @@ jobs:
         #   interna do Job é idempotente (verifica antes de criar), então
         #   rodar de novo em todo deploy é seguro e não duplica nada.
 
-      - name: 18. Aplicar Portainer (namespace, RBAC, Deployment, Service)
-        run: kubectl apply -f k3s-cluster/portainer.yaml
-        # ↑ 🔒 Passo novo (auditoria ago/2026) — Portainer já rodava no
-        #   cluster desde antes, aplicado manualmente; movido para dentro
-        #   do GitOps nesta auditoria (ver cabeçalho de `portainer.yaml`
-        #   para o porquê e as duas mudanças de segurança feitas em cima
-        #   do manifesto oficial). Independente do resto da stack de
-        #   autenticação — colocado por último de propósito, para uma
-        #   eventual falha aqui nunca impedir o Keycloak/Postgres/
-        #   Vaultwarden (o que realmente importa) de serem atualizados.
+      # ↑ 🔒 Passo "Aplicar Portainer" REMOVIDO do pipeline automático
+      #   (auditoria set/2026, escopo de RBAC do runner). Motivo: o RBAC do
+      #   runner foi restringido do antigo `cluster-admin` sobre o cluster
+      #   inteiro para uma ServiceAccount escopada só ao namespace
+      #   `authentication` (+ permissão pontual sobre a Namespace/
+      #   StorageClass, que são cluster-scoped) — ver `k3s-cluster/
+      #   portainer.yaml` para o racional completo. `portainer.yaml` cria
+      #   recursos num namespace DIFERENTE (`portainer`) e, mais importante,
+      #   inclui um ClusterRoleBinding que concede `cluster-admin` à própria
+      #   ServiceAccount do Portainer — dar ao runner permissão para aplicar
+      #   esse arquivo exigiria dar a ele permissão de CONCEDER cluster-admin
+      #   a outras contas, o que anularia o propósito de restringir o RBAC.
+      #   Portainer muda raramente (painel de administração, não faz parte
+      #   do fluxo de autenticação em si) — aplicado manualmente por um
+      #   humano com o kubeconfig admin quando precisar:
+      #     kubectl apply -f k3s-cluster/portainer.yaml
 
-      - name: 19. Resumo final do estado do cluster
+      - name: 18. Resumo final do estado do cluster
         if: always()
         # ↑ `if: always()` faz este passo rodar SEMPRE, mesmo se algum passo
         #   anterior tiver falhado — útil para diagnóstico rápido direto
         #   nos logs da GitHub Actions, sem precisar acessar a VM via SSH.
+        #   Não inclui mais `kubectl get pods -n portainer` (removido junto
+        #   com o passo acima) — o runner escopado não tem visibilidade
+        #   nesse namespace, e o comando falharia o step inteiro.
         run: |
           echo "----- Pods no namespace authentication -----"
           kubectl get pods -n authentication -o wide
@@ -352,5 +370,3 @@ jobs:
           kubectl get svc -n authentication -o wide
           echo "----- CronJobs de backup -----"
           kubectl get cronjob -n authentication
-          echo "----- Portainer -----"
-          kubectl get pods -n portainer -o wide

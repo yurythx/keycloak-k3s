@@ -30,6 +30,18 @@
 #   HTTPS fica acessível na rede (mudança 1 acima), e o acesso à própria
 #   UI do Portainer deve ser tratado como equivalente a acesso root ao
 #   cluster (MFA na conta, senha forte, não compartilhar credencial).
+#
+# 🔒 APLICADO MANUALMENTE, NÃO PELO PIPELINE (desde set/2026)
+#   Este arquivo NÃO faz mais parte do `deploy.yml` automático. Motivo: o
+#   RBAC do runner do GitHub Actions foi escopado ao namespace
+#   `authentication` (ver cabeçalho de `deploy.yml`) — e este manifesto
+#   concede `cluster-admin` a uma ServiceAccount, o que exigiria dar ao
+#   runner permissão para CONCEDER cluster-admin a outras contas,
+#   reabrindo exatamente o caminho de escalonamento de privilégio que a
+#   restrição do RBAC do runner foi feita para fechar. Portainer muda
+#   raramente — aplique manualmente, como administrador, com o kubeconfig
+#   admin (`~dti/.kube/config`, não o do runner):
+#     kubectl apply -f k3s-cluster/portainer.yaml
 # ==============================================================================
 
 apiVersion: v1
